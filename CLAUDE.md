@@ -94,10 +94,9 @@ Both the library (`protocol/`) and the binaries use `anyhow::Result` end-to-end.
 
 ## Remotes
 
-- `origin` — GitHub (public): https://github.com/julianjc84/draytek-ssl-vpn-client-linux
-- `omv` — NAS mirror (private): `omv:/srv/dev-disk-by-uuid-bea51c11-5f48-44fb-a728-6acfe6c133bb/ProjectGitSync/DrayTek_Smart_VPN_ParentFolder/draytek-ssl-vpn-client-linux.git`
+- `origin` — GitHub: `git@github.com:tphuc012/draytek-ssl-vpn-client-linux.git`
 
-Push to both.
+Push to `master`.
 
 ## Runtime Logs
 
