@@ -7,7 +7,16 @@ use std::cell::Cell;
 /// Build the connection status view.
 #[derive(Clone)]
 pub struct ConnectionView {
+    /// Status text and detail rows. Meant to go inside a scroller: the amount of
+    /// detail varies with the state, and the window can be shorter than the
+    /// tallest of them.
     pub container: gtk4::Box,
+    /// The connect/disconnect buttons, kept out of `container` on purpose.
+    ///
+    /// These must stay on screen at every window size. Inside the scroller they
+    /// were the first thing to be pushed out of view, which is how a window can
+    /// end up showing a status the user has no control over.
+    pub actions: gtk4::Box,
     status_label: gtk4::Label,
     timer_label: gtk4::Label,
     /// Status text for the states with no detail to show.
@@ -16,6 +25,7 @@ pub struct ConnectionView {
     info_box: gtk4::Box,
     server_label: gtk4::Label,
     ip_label: gtk4::Label,
+    dns_label: gtk4::Label,
     routing_label: gtk4::Label,
     /// Individual stats labels (visible when connected).
     stats_box: gtk4::Box,
@@ -78,8 +88,8 @@ fn format_duration(secs: u64) -> String {
 impl ConnectionView {
     pub fn new() -> Self {
         let container = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
-        container.set_margin_top(24);
-        container.set_margin_bottom(24);
+        container.set_margin_top(16);
+        container.set_margin_bottom(8);
         container.set_margin_start(24);
         container.set_margin_end(24);
 
@@ -118,6 +128,12 @@ impl ConnectionView {
 
         let server_label = info_label("The VPN server this connection was made to");
         let ip_label = info_label("Address assigned to the tunnel interface");
+        let dns_label = info_label(
+            "Name servers the router handed out over IPCP.\n\
+             Worth checking when the tunnel is up but nothing resolves: a full \
+             tunnel sends DNS through the tunnel too, so an unreachable resolver \
+             looks exactly like being offline.",
+        );
         let routing_label = info_label(
             "What goes through the tunnel.\n\
              A full tunnel sends everything; otherwise only the listed subnets.",
@@ -125,6 +141,7 @@ impl ConnectionView {
 
         info_box.append(&server_label);
         info_box.append(&ip_label);
+        info_box.append(&dns_label);
         info_box.append(&routing_label);
 
         let stats_box = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
@@ -155,20 +172,26 @@ impl ConnectionView {
         container.append(&info_box);
         container.append(&stats_box);
 
-        let btn_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 12);
-        btn_row.set_homogeneous(true);
-        btn_row.append(&connect_btn);
-        btn_row.append(&disconnect_btn);
-        container.append(&btn_row);
+        // Pinned outside the scrolling area, so the controls survive any window
+        // height. See the note on `actions`.
+        let actions = gtk4::Box::new(gtk4::Orientation::Horizontal, 12);
+        actions.set_homogeneous(true);
+        actions.set_margin_start(24);
+        actions.set_margin_end(24);
+        actions.set_margin_bottom(16);
+        actions.append(&connect_btn);
+        actions.append(&disconnect_btn);
 
         Self {
             container,
+            actions,
             status_label,
             timer_label,
             details_label,
             info_box,
             server_label,
             ip_label,
+            dns_label,
             routing_label,
             stats_box,
             tx_label,
@@ -214,6 +237,9 @@ impl ConnectionView {
                     .set_label(&format!("Asking NetworkManager to bring up {}", view.name));
                 self.set_prose(true);
                 self.set_icon("network-transmit-symbolic", true);
+                // Disconnect doubles as cancel here, so offer it rather than a
+                // Connect that would only queue a second attempt.
+                self.connect_btn.set_visible(false);
                 self.disconnect_btn.set_visible(true);
             }
             Phase::Failed => {
@@ -236,10 +262,15 @@ impl ConnectionView {
                     "Tunnel IP: {}",
                     display_or_unknown(&view.local_ip)
                 ));
+                self.dns_label.set_label(&dns_summary(view));
                 self.routing_label.set_label(&routing_summary(view));
                 self.set_detail_rows(true);
 
                 self.set_icon("network-vpn-symbolic", true);
+                // The reset above left Connect visible; a connected tunnel has
+                // nothing to connect, and two lit buttons for opposing actions is
+                // how you get a user to press the wrong one.
+                self.connect_btn.set_visible(false);
                 self.disconnect_btn.set_visible(true);
                 self.set_stats_visibility(true);
             }
@@ -343,6 +374,18 @@ fn routing_summary(view: &StatusView) -> String {
         return "Routing: nothing — no traffic goes through the tunnel".to_string();
     }
     format!("Routing: {}", view.routes.join(", "))
+}
+
+/// One line naming the resolvers in use.
+///
+/// Saying "none" plainly matters more than hiding the row: a full tunnel moves
+/// DNS onto the tunnel as well, so a resolver the router cannot reach produces
+/// a working tunnel that resolves nothing.
+fn dns_summary(view: &StatusView) -> String {
+    if view.dns.is_empty() {
+        return "DNS: none from the router — using the system's".to_string();
+    }
+    format!("DNS: {}", view.dns.join(", "))
 }
 
 #[cfg(test)]

@@ -29,7 +29,6 @@ impl LogView {
         let scrolled = gtk4::ScrolledWindow::builder()
             .child(&text_view)
             .vexpand(true)
-            .min_content_height(200)
             .build();
 
         // Header with clear button

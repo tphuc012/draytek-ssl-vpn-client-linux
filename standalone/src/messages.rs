@@ -15,6 +15,8 @@ pub struct StatusView {
     pub name: String,
     pub local_ip: String,
     pub server: String,
+    /// Resolvers NetworkManager applied to the tunnel.
+    pub dns: Vec<String>,
     /// Routes installed on the tunnel, excluding the default route, which
     /// `is_default_route` already reports.
     pub routes: Vec<String>,
@@ -57,6 +59,7 @@ impl From<&VpnState> for StatusView {
                 name,
                 ip,
                 server,
+                dns,
                 connected_at,
                 ..
             } => Self {
@@ -64,6 +67,7 @@ impl From<&VpnState> for StatusView {
                 name: name.clone(),
                 local_ip: ip.clone(),
                 server: server.clone(),
+                dns: dns.clone(),
                 routes: state.display_routes(),
                 is_default_route: state.has_default_route(),
                 connected_secs: elapsed_since(*connected_at),
@@ -88,6 +92,7 @@ mod tests {
             name: "Office".to_string(),
             ip: "192.168.1.104".to_string(),
             server: "117.2.126.196:4430".to_string(),
+            dns: vec!["116.97.90.124".to_string()],
             routes: routes.iter().map(|r| r.to_string()).collect(),
             path: OwnedObjectPath::try_from("/org/freedesktop/NetworkManager/ActiveConnection/1")
                 .expect("static path is valid"),
@@ -107,6 +112,7 @@ mod tests {
         assert_eq!(view.phase, Phase::Connected);
         assert!(view.is_default_route);
         assert_eq!(view.routes, vec!["192.168.1.0/24", "10.0.0.0/8"]);
+        assert_eq!(view.dns, vec!["116.97.90.124"]);
     }
 
     #[test]

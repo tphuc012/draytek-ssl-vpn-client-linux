@@ -41,9 +41,9 @@ impl MainWindow {
         let window = adw::ApplicationWindow::builder()
             .application(app)
             .title("DrayTek SSL VPN")
-            .default_width(520)
-            .default_height(680)
-            .width_request(520)
+            .default_width(560)
+            .default_height(820)
+            .width_request(480)
             .height_request(420)
             .build();
 
@@ -110,19 +110,38 @@ impl MainWindow {
         let connection_view = ConnectionView::new();
         let log_view = LogView::new(log_buffer);
 
-        let scroller = gtk4::ScrolledWindow::builder()
-            .hexpand(true)
-            .vexpand(false)
-            .child(&connection_view.container)
-            .build();
-        content.append(&scroller);
-
-        let log_scroller = gtk4::ScrolledWindow::builder()
+        // The status area scrolls — the tallest state is the connected one with
+        // three detail rows plus three counters — but the buttons below it do
+        // not, so shrinking the window never hides the controls.
+        let status_scroller = gtk4::ScrolledWindow::builder()
             .hexpand(true)
             .vexpand(true)
-            .child(&log_view.container)
+            .hscrollbar_policy(gtk4::PolicyType::Never)
+            .child(&connection_view.container)
             .build();
-        content.append(&log_scroller);
+
+        let top_pane = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        top_pane.append(&status_scroller);
+        top_pane.append(&connection_view.actions);
+
+        // A resizable split rather than two boxes competing for leftover space:
+        // the log used to expand freely and squeeze the status area until the
+        // buttons were pushed out of sight.
+        let paned = gtk4::Paned::builder()
+            .orientation(gtk4::Orientation::Vertical)
+            .vexpand(true)
+            .build();
+        paned.set_start_child(Some(&top_pane));
+        paned.set_end_child(Some(&log_view.container));
+        paned.set_position(420);
+        paned.set_resize_start_child(true);
+        paned.set_resize_end_child(true);
+        // The status area is the one that must not be starved, so it keeps its
+        // size and the log gives way instead.
+        paned.set_shrink_start_child(false);
+        paned.set_shrink_end_child(true);
+
+        content.append(&paned);
         toolbar_view.set_content(Some(&content));
 
         // ── NM wiring ────────────────────────────────────────────────────

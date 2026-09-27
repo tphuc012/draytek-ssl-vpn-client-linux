@@ -46,6 +46,13 @@ pub enum VpnState {
         /// peer — NM does not expose the latter, and conflating the two makes
         /// the display claim a gateway address the tunnel never had.
         server: String,
+        /// Resolvers NM applied to the tunnel, from the active connection's
+        /// IPv4 config.
+        ///
+        /// Worth carrying: a full tunnel routes DNS through the tunnel as well,
+        /// so a resolver the router cannot reach gives a tunnel that is up,
+        /// routed, and unable to resolve anything.
+        dns: Vec<String>,
         routes: Vec<String>,
         path: OwnedObjectPath,
         connected_at: u64,
@@ -168,6 +175,19 @@ trait Ip4Config {
 
     #[zbus(property)]
     fn route_data(&self) -> zbus::Result<Vec<HashMap<String, zbus::zvariant::OwnedValue>>>;
+
+    /// The resolvers, as `aa{sv}` entries keyed by `address`.
+    ///
+    /// Named `NameserverData` since NM 1.40. Older versions called the same
+    /// thing `DnsData`, which is why the read below falls back — a proxy
+    /// property that does not exist simply errors, so trying both is cheap and
+    /// the failure stays a debug line rather than a warning on every connect.
+    #[zbus(property)]
+    fn nameserver_data(&self) -> zbus::Result<Vec<HashMap<String, zbus::zvariant::OwnedValue>>>;
+
+    /// The pre-1.40 spelling of `nameserver_data`.
+    #[zbus(property)]
+    fn dns_data(&self) -> zbus::Result<Vec<HashMap<String, zbus::zvariant::OwnedValue>>>;
 }
 
 /// org.freedesktop.NetworkManager.Settings.Connection
@@ -477,14 +497,16 @@ async fn handle_vpn_state(
         vpn_conn_state::ACTIVATED => {
             let ip = read_ip(conn, ac).await.unwrap_or_default();
             let server = read_vpn_server(conn, ac).await.unwrap_or_default();
+            let dns = read_dns(conn, ac).await.unwrap_or_default();
             let routes = read_routes(conn, ac).await.unwrap_or_default();
             let connected_at = read_connection_timestamp(conn, ac).await.unwrap_or(0);
             let keepalive = read_vpn_keepalive(conn, ac).await.unwrap_or(false);
-            info!("VPN connected: {name} ip={ip} server={server} routes={routes:?} timestamp={connected_at} keepalive={keepalive}");
+            info!("VPN connected: {name} ip={ip} server={server} dns={dns:?} routes={routes:?} timestamp={connected_at} keepalive={keepalive}");
             VpnState::Connected {
                 name: name.to_string(),
                 ip,
                 server,
+                dns,
                 routes,
                 path: path.clone(),
                 connected_at,
@@ -523,6 +545,83 @@ async fn read_ip(conn: &Connection, ac: &ActiveConnectionProxy<'_>) -> Option<St
     let first = addresses.first()?;
     let addr: String = first.get("address")?.clone().try_into().ok()?;
     Some(addr)
+}
+
+/// Read the resolvers NM applied, from the active connection's Ip4Config.
+///
+/// Every failure is logged rather than collapsed into an empty list. "The router
+/// gave us no DNS" and "we could not read what NM has" call for opposite
+/// reactions — the first is a router problem, the second is a bug here — and the
+/// status view cannot tell them apart unless this does.
+async fn read_dns(conn: &Connection, ac: &ActiveConnectionProxy<'_>) -> Option<Vec<String>> {
+    let ip4_path = match ac.ip4_config().await {
+        Ok(p) if p.as_str() != "/" => p,
+        Ok(_) => {
+            debug!("no IP4Config on the active connection yet; DNS not read");
+            return None;
+        }
+        Err(e) => {
+            warn!("could not read the active connection's IP4Config: {e}");
+            return None;
+        }
+    };
+
+    let ip4 = match Ip4ConfigProxy::builder(conn)
+        .path(ip4_path.as_ref())
+        .ok()
+        .map(|b| b.cache_properties(CacheProperties::No))
+    {
+        Some(builder) => match builder.build().await {
+            Ok(p) => p,
+            Err(e) => {
+                warn!("could not read IP4Config at {ip4_path}: {e}");
+                return None;
+            }
+        },
+        None => {
+            warn!("IP4Config path {ip4_path} is not a valid object path");
+            return None;
+        }
+    };
+
+    let entries: Vec<HashMap<String, OwnedValue>> = match ip4.nameserver_data().await {
+        Ok(e) => e,
+        Err(e) => {
+            // Pre-1.40 NM spells it `DnsData`. Only worth trying when the modern
+            // name is genuinely absent, so a real read error is not masked.
+            debug!("nameserver_data unavailable ({e}); trying the pre-1.40 DnsData");
+            match ip4.dns_data().await {
+                Ok(e) => e,
+                Err(e) => {
+                    warn!(
+                        "IP4Config at {ip4_path} exposes no readable nameserver data \
+                         (nameserver_data: {e}; DnsData: {e2})",
+                        e2 = e
+                    );
+                    return None;
+                }
+            }
+        }
+    };
+
+    let servers: Vec<String> = entries
+        .iter()
+        .filter_map(|entry| {
+            let value = entry.get("address")?;
+            match value.clone().try_into() {
+                Ok(s) => Some(s),
+                Err(_) => {
+                    warn!("dns_data entry has a non-string address: {value:?}");
+                    None
+                }
+            }
+        })
+        .collect();
+
+    if servers.is_empty() {
+        debug!("IP4Config at {ip4_path} reports no DNS servers");
+    }
+    (!servers.is_empty()).then_some(servers)
 }
 
 /// Read routes from the active connection's Ip4Config.
