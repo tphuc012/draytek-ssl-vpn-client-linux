@@ -11,8 +11,18 @@ use tracing::{info, warn};
 
 use draytek_vpn_protocol::endpoint;
 
-/// TUN device name used for the VPN tunnel.
-pub const TUN_DEVICE_NAME: &str = "draytek0";
+/// TUN device name used by this client.
+///
+/// Deliberately *not* `draytek0`. The NetworkManager plugin uses that name, and
+/// a TUN is a single shared character device: two clients that pick the same
+/// name do not get two tunnels, they get one device whose packets each one
+/// steals from the other. Worse, this client removes a leftover device of the
+/// same name before connecting, so it would delete the interface out from under
+/// a live NM connection and then silently take over its traffic.
+///
+/// Keeping the names apart is what lets both run on the same machine without
+/// either having to disconnect the other.
+pub const TUN_DEVICE_NAME: &str = "draytekapp0";
 
 /// Check whether the TUN device exists (stale or active).
 pub fn is_device_present(device: &str) -> bool {
@@ -294,5 +304,35 @@ pub async fn teardown(device: &str, restore_dns: bool) {
         Err(e) => {
             warn!("Failed to execute helper for teardown: {e:#}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The device name is passed to the helper, which validates it before
+    /// handing it to `ip tuntap add`. A name the helper rejects means every
+    /// connect fails at the last step, with the validation error buried in
+    /// helper output rather than anything pointing at the cause.
+    #[test]
+    fn device_name_passes_the_helper_validator() {
+        let name = TUN_DEVICE_NAME;
+        assert!(!name.is_empty() && name.len() <= 15, "{name} is too long");
+        assert!(name.starts_with(|c: char| c.is_ascii_alphabetic()));
+        assert!(name.chars().all(|c| c.is_ascii_alphanumeric()));
+    }
+
+    /// A TUN is one shared character device: two clients choosing the same name
+    /// do not get two tunnels, they get one device each stealing the other's
+    /// packets. This client's setup also deletes a leftover device of this name
+    /// before connecting, so sharing a name means tearing down a live NM tunnel.
+    #[test]
+    fn device_name_does_not_collide_with_the_nm_plugin() {
+        const NM_PLUGIN_DEVICE: &str = "draytek0";
+        assert_ne!(
+            TUN_DEVICE_NAME, NM_PLUGIN_DEVICE,
+            "the standalone client and the NM plugin must not share a TUN device name"
+        );
     }
 }

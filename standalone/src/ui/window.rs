@@ -355,22 +355,23 @@ impl MainWindow {
                 );
 
                 let body = match (device_present, pin_present) {
-                    (true, true) => {
-                        "A tunnel device (draytek0) and a route keeping the VPN server outside \
+                    (true, true) => format!(
+                        "A tunnel device ({device}) and a route keeping the VPN server outside \
                          the tunnel are both left over from a previous session. \
-                         This may affect your network. Clean them up?"
-                    }
-                    (true, false) => {
-                        "A tunnel device (draytek0) from a previous session is still active. \
-                         This may affect your network. Clean it up?"
-                    }
+                         This may affect your network. Clean them up?",
+                        device = privilege::TUN_DEVICE_NAME
+                    ),
+                    (true, false) => format!(
+                        "A tunnel device ({device}) from a previous session is still active. \
+                         This may affect your network. Clean it up?",
+                        device = privilege::TUN_DEVICE_NAME
+                    ),
                     // No device, but the pin alone still sends the VPN server's
                     // traffic down a gateway from a network you may no longer be on.
-                    _ => {
-                        "A route keeping the VPN server outside the tunnel is left over from \
+                    _ => "A route keeping the VPN server outside the tunnel is left over from \
                          a previous session. It points at the network you were on then, so \
                          connecting from a different network will fail. Clean it up?"
-                    }
+                        .to_string(),
                 };
 
                 let dialog = adw::AlertDialog::builder()
