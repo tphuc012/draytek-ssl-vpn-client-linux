@@ -1,5 +1,6 @@
 pub mod connection;
 pub mod constants;
+pub mod endpoint;
 pub mod engine_common;
 pub mod keepalive;
 pub mod negotiate;

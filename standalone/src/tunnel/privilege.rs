@@ -9,6 +9,8 @@ use std::net::Ipv4Addr;
 use std::sync::OnceLock;
 use tracing::{info, warn};
 
+use draytek_vpn_protocol::endpoint;
+
 /// TUN device name used for the VPN tunnel.
 pub const TUN_DEVICE_NAME: &str = "draytek0";
 
@@ -106,6 +108,58 @@ fn needs_pkexec() -> bool {
             }
         }
     })
+}
+
+/// Pin the VPN server's own address to the physical link.
+///
+/// Must run before the tunnel's default route is installed. Once every packet
+/// is routed into the tunnel, the SSTP connection carrying it is pulled in too
+/// and the tunnel tears itself down. See `protocol::endpoint` for details.
+pub async fn pin_endpoint(route: &endpoint::EndpointRoute) -> Result<()> {
+    let helper = find_helper()?;
+    let mut args = vec![
+        helper,
+        "pin-endpoint".to_string(),
+        "--ip".to_string(),
+        route.server.to_string(),
+        "--device".to_string(),
+        route.device.clone(),
+    ];
+    if let Some(gateway) = route.gateway {
+        args.push("--gateway".to_string());
+        args.push(gateway.to_string());
+    }
+
+    let output = run_helper(args).await?;
+    if !output.status.success() {
+        anyhow::bail!("Failed to pin VPN endpoint (exit {})", output.status);
+    }
+    info!("Pinned VPN endpoint {} on {}", route.server, route.device);
+    Ok(())
+}
+
+/// Remove a pin installed by [`pin_endpoint`]. Best-effort.
+pub async fn unpin_endpoint(server: Ipv4Addr) {
+    let helper = match find_helper() {
+        Ok(h) => h,
+        Err(e) => {
+            warn!("Cannot find helper to remove endpoint pin: {e:#}");
+            return;
+        }
+    };
+    let args = vec![
+        helper,
+        "unpin-endpoint".to_string(),
+        "--ip".to_string(),
+        server.to_string(),
+    ];
+    match run_helper(args).await {
+        Ok(output) if !output.status.success() => {
+            warn!("Failed to remove VPN endpoint pin (exit {})", output.status);
+        }
+        Ok(_) => {}
+        Err(e) => warn!("Failed to run helper to remove endpoint pin: {e:#}"),
+    }
 }
 
 /// Run the helper binary, using pkexec only if the helper lacks CAP_NET_ADMIN.

@@ -29,6 +29,14 @@ pub struct VpnPlugin {
     vpn_state: u32,
     tunnel: Option<TunnelHandle>,
     connection: Connection,
+    /// Secrets handed to us by NM through `NewSecrets`.
+    ///
+    /// NM may deliver the password out-of-band: it calls `NeedSecrets`, gets
+    /// the answer from a secret agent, then calls `NewSecrets`. That value is
+    /// not present in the `Settings` passed to `ConnectInteractive`, so it has
+    /// to be kept here and merged in when the tunnel is actually started.
+    /// Discarding it left the profile with an empty password.
+    extra_secrets: HashMap<String, String>,
 }
 
 impl VpnPlugin {
@@ -37,7 +45,20 @@ impl VpnPlugin {
             vpn_state: nm_vpn_state::INIT,
             tunnel: None,
             connection,
+            extra_secrets: HashMap::new(),
         }
+    }
+
+    /// Pull the `vpn.secrets` section out of an NM `Settings` map.
+    fn extract_secrets(settings: &Settings) -> HashMap<String, String> {
+        settings
+            .get("vpn")
+            .and_then(|vpn| vpn.get("secrets"))
+            .and_then(|secrets| {
+                let dict: Result<HashMap<String, String>, _> = secrets.clone().try_into();
+                dict.ok()
+            })
+            .unwrap_or_default()
     }
 }
 
@@ -66,44 +87,55 @@ impl VpnPlugin {
 
     /// Check if secrets are needed. Returns the setting name that needs secrets, or "".
     async fn need_secrets(&self, settings: Settings) -> zbus::fdo::Result<String> {
-        let has_password = settings
-            .get("vpn")
-            .and_then(|v| v.get("secrets"))
-            .and_then(|v| {
-                let dict: Result<HashMap<String, String>, _> = v.clone().try_into();
-                dict.ok()
-            })
-            .map(|d| d.contains_key("password"))
-            .unwrap_or(false);
-
-        if has_password {
+        // The name must match the key inside `vpn.secrets`. Returning "vpn"
+        // here asked the secret agent for a secret that does not exist, so the
+        // agent never answered and NM timed out.
+        let has_password = Self::extract_secrets(&settings).contains_key("password");
+        if has_password || self.extra_secrets.contains_key("password") {
+            info!("NeedSecrets: password already available");
             Ok(String::new())
         } else {
-            Ok("vpn".to_string())
+            info!("NeedSecrets: requesting 'password' from secret agent");
+            Ok("password".to_string())
         }
     }
 
-    /// Accept updated secrets.
-    async fn new_secrets(&mut self, _settings: Settings) -> zbus::fdo::Result<()> {
-        info!("NewSecrets called");
+    /// Accept updated secrets from NM's secret agent.
+    ///
+    /// These must be retained: they are not part of the `Settings` NM passes
+    /// to `ConnectInteractive`, and the tunnel cannot authenticate without
+    /// them.
+    async fn new_secrets(&mut self, settings: Settings) -> zbus::fdo::Result<()> {
+        let secrets = Self::extract_secrets(&settings);
+        info!("NewSecrets called with {} secret(s)", secrets.len());
+        self.extra_secrets = secrets;
         Ok(())
     }
 
     /// Disconnect the active VPN connection.
+    ///
+    /// Returns as soon as the tunnel has been asked to stop. The tunnel task
+    /// emits STOPPING and STOPPED once its teardown has really finished, so
+    /// they are not emitted here — and awaiting the task here would deadlock
+    /// against the object-server lock the task itself needs (see
+    /// `TunnelHandle::disconnect`).
     async fn disconnect(
         &mut self,
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
     ) -> zbus::fdo::Result<()> {
         info!("Disconnect called");
-        if let Some(handle) = self.tunnel.take() {
-            handle.disconnect().await;
+        match self.tunnel.take() {
+            Some(handle) => handle.disconnect(),
+            None => {
+                // No tunnel running, so there is no task left to report for us.
+                Self::state_changed(&emitter, nm_vpn_state::STOPPING)
+                    .await
+                    .ok();
+                Self::state_changed(&emitter, nm_vpn_state::STOPPED)
+                    .await
+                    .ok();
+            }
         }
-        Self::state_changed(&emitter, nm_vpn_state::STOPPING)
-            .await
-            .ok();
-        Self::state_changed(&emitter, nm_vpn_state::STOPPED)
-            .await
-            .ok();
         self.vpn_state = nm_vpn_state::STOPPED;
         Ok(())
     }
@@ -162,7 +194,7 @@ impl VpnPlugin {
         emitter: &SignalEmitter<'_>,
     ) -> zbus::fdo::Result<()> {
         // Parse settings
-        let profile = match crate::tunnel::parse_settings(&settings) {
+        let mut profile = match crate::tunnel::parse_settings(&settings) {
             Ok(p) => p,
             Err(e) => {
                 error!("Failed to parse settings: {e:#}");
@@ -172,6 +204,25 @@ impl VpnPlugin {
                 return Err(zbus::fdo::Error::Failed(format!("Invalid settings: {e:#}")));
             }
         };
+
+        // NM may hand the password over separately via NewSecrets, in which case
+        // it is absent from `settings`. Merge it in before authenticating.
+        if profile.password.is_empty() {
+            if let Some(password) = self.extra_secrets.get("password") {
+                info!("Using password supplied via NewSecrets");
+                profile.password = password.clone();
+            }
+        }
+
+        if profile.password.is_empty() {
+            error!("No password available — refusing to start a tunnel that cannot authenticate");
+            Self::failure(emitter, nm_vpn_failure::LOGIN_FAILED)
+                .await
+                .ok();
+            return Err(zbus::fdo::Error::Failed(
+                "No VPN password available".to_string(),
+            ));
+        }
 
         // Signal starting
         Self::state_changed(emitter, nm_vpn_state::STARTING)

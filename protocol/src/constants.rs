@@ -23,6 +23,7 @@ pub const PPP_LCP_CONFIG_AUTH_PROTO: u8 = 3;
 pub const PPP_LCP_MAGIC_NUM: u8 = 5;
 
 // PPP IPCP Option Types
+pub const PPP_IPCP_CONFIG_NETMASK: u8 = 1;
 pub const PPP_IPCP_CONFIG_IP_ADDR: u8 = 3;
 pub const PPP_IPCP_CONFIG_DNS_ADDR: u8 = 0x81; // -127 as i8 = 129 as u8
 
@@ -65,7 +66,6 @@ pub const AUTH_MSCHAPV1_DATA: [u8; 3] = [0xC2, 0x23, 0x80];
 
 // MRU
 pub const DEFAULT_MRU: u16 = 1280;
-pub const MAX_PACKET_SIZE: usize = 1500;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthMethod {

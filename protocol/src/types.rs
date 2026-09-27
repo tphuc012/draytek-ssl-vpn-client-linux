@@ -53,6 +53,7 @@ pub struct NegotiationResult {
     pub socket_buf: BytesMut,
     pub local_ip: Ipv4Addr,
     pub remote_ip: Ipv4Addr,
+    pub netmask: Ipv4Addr,
     pub dns: Option<Ipv4Addr>,
     pub local_mru: u16,
     pub remote_mru: u16,

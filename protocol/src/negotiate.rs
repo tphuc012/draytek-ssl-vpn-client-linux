@@ -271,6 +271,7 @@ pub async fn negotiate(
     let local_ip =
         ipcp::get_local_ip(&ipcp_fsm).context("IPCP completed but no local IP assigned")?;
     let remote_ip = ipcp::get_remote_ip(&ipcp_fsm).unwrap_or(Ipv4Addr::new(0, 0, 0, 0));
+    let netmask = ipcp::get_local_netmask(&ipcp_fsm);
     let dns = ipcp::get_local_dns(&ipcp_fsm);
     let local_mru = lcp::get_local_mru(&lcp_fsm).unwrap_or(DEFAULT_MRU);
     let remote_mru = lcp::get_remote_mru(&lcp_fsm).unwrap_or(DEFAULT_MRU);
@@ -282,6 +283,7 @@ pub async fn negotiate(
         socket_buf,
         local_ip,
         remote_ip,
+        netmask,
         dns,
         local_mru,
         remote_mru,

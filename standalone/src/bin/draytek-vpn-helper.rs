@@ -16,6 +16,8 @@ fn main() -> ExitCode {
         "setup" => cmd_setup(&args[2..]),
         "teardown" => cmd_teardown(&args[2..]),
         "check" => cmd_check(),
+        "pin-endpoint" => cmd_pin_endpoint(&args[2..]),
+        "unpin-endpoint" => cmd_unpin_endpoint(&args[2..]),
         other => {
             eprintln!("Unknown subcommand: {other}");
             Err("Unknown subcommand".into())
@@ -252,6 +254,102 @@ fn direct_dns_setup(dns_ip: Ipv4Addr) -> Result<(), Box<dyn std::error::Error>> 
 }
 
 // ── Subcommands ───────────────────────────────────────────────────────────────
+
+/// Pin the VPN server's own address to the physical link.
+///
+/// Once this connection becomes the default route, every packet goes into the
+/// tunnel — including the SSTP connection that carries the tunnel. The server
+/// then receives its own control traffic from the inside and cannot return it,
+/// the TCP connection breaks, and the tunnel dies while the default route still
+/// points at it. A host route for the endpoint keeps the control path outside.
+fn cmd_pin_endpoint(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut server = None;
+    let mut gateway = None;
+    let mut device = None;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--ip" => {
+                i += 1;
+                server = Some(
+                    args.get(i)
+                        .ok_or("--ip requires a value")?
+                        .parse::<Ipv4Addr>()?,
+                );
+            }
+            "--gateway" => {
+                i += 1;
+                gateway = Some(
+                    args.get(i)
+                        .ok_or("--gateway requires a value")?
+                        .parse::<Ipv4Addr>()?,
+                );
+            }
+            "--device" => {
+                i += 1;
+                device = Some(args.get(i).ok_or("--device requires a value")?.clone());
+            }
+            other => return Err(format!("Unknown option: {other}").into()),
+        }
+        i += 1;
+    }
+
+    let server = server.ok_or("--ip is required")?;
+    let device = device.ok_or("--device is required")?;
+    // The device name reaches `ip` as a separate argv element, so validate it
+    // against the same character set used elsewhere. Interface names may
+    // contain `.`, `-` and `_`, which `validate_device_name` rejects because it
+    // only ever sees our own short TUN name.
+    if !device
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
+    {
+        return Err(format!("Invalid device name: {device}").into());
+    }
+
+    let cidr = format!("{server}/32");
+    let mut owned: Vec<String> = vec!["route".into(), "replace".into(), cidr.clone()];
+    if let Some(gw) = gateway {
+        owned.push("via".into());
+        owned.push(gw.to_string());
+    }
+    owned.push("dev".into());
+    owned.push(device.clone());
+    let borrowed: Vec<&str> = owned.iter().map(String::as_str).collect();
+
+    run_cmd("ip", &borrowed)?;
+    eprintln!("Pinned VPN endpoint {cidr} on {device}");
+    Ok(())
+}
+
+/// Remove a pin created by `pin-endpoint`. Best-effort.
+fn cmd_unpin_endpoint(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut server = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--ip" => {
+                i += 1;
+                server = Some(
+                    args.get(i)
+                        .ok_or("--ip requires a value")?
+                        .parse::<Ipv4Addr>()?,
+                );
+            }
+            other => return Err(format!("Unknown option: {other}").into()),
+        }
+        i += 1;
+    }
+    let server = server.ok_or("--ip is required")?;
+    let cidr = format!("{server}/32");
+    if let Err(e) = run_cmd("ip", &["route", "del", &cidr]) {
+        eprintln!("Warning: failed to remove endpoint pin: {e}");
+    } else {
+        eprintln!("Removed VPN endpoint pin {cidr}");
+    }
+    Ok(())
+}
 
 fn cmd_setup(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let setup = parse_setup_args(args)?;

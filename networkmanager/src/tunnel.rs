@@ -9,7 +9,7 @@ use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::Notify;
+use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 use zbus::zvariant::OwnedValue;
 use zbus::Connection;
@@ -18,12 +18,15 @@ use crate::plugin::nm_vpn_failure;
 
 use draytek_vpn_protocol::connection;
 use draytek_vpn_protocol::constants::*;
+use draytek_vpn_protocol::endpoint;
 use draytek_vpn_protocol::engine_common::{
-    execute_actions, send_ppp_frame, PingKeeper, PppFsmPair, TrafficStats, TunnelAddrs,
+    execute_actions, send_ppp_frame, send_ppp_frame_cancellable, PingKeeper, PppFsmPair,
+    TrafficStats, TunnelAddrs, WriteOutcome,
 };
 use draytek_vpn_protocol::keepalive::KeepaliveTracker;
 use draytek_vpn_protocol::negotiate::{self, NegotiationStatus};
 use draytek_vpn_protocol::protocol::fsm::FsmEvent;
+use draytek_vpn_protocol::protocol::ipcp;
 use draytek_vpn_protocol::protocol::ppp::PppFrame;
 use draytek_vpn_protocol::protocol::ppp_control::PppControlFrame;
 use draytek_vpn_protocol::protocol::sstp::SstpPacket;
@@ -45,12 +48,27 @@ fn parse_cidr(s: &str) -> Option<(Ipv4Addr, u32)> {
 
 /// Handle for controlling a running tunnel.
 pub struct TunnelHandle {
-    shutdown: Arc<Notify>,
+    /// Set to `true` to ask the data loop to stop.
+    ///
+    /// A `watch` channel is used rather than `Notify` on purpose: with
+    /// `notify_one` a permit can be consumed by a `notified()` future that then
+    /// loses its `select!` race and is dropped, and the stop request is lost
+    /// forever. `watch` stores the value, so the next `changed()` always sees
+    /// it.
+    cancel: watch::Sender<bool>,
 }
 
 impl TunnelHandle {
-    pub async fn disconnect(&self) {
-        self.shutdown.notify_one();
+    /// Ask the tunnel to stop. Returns immediately.
+    ///
+    /// This must not await the tunnel task. The task emits its own
+    /// STOPPING/STOPPED signals through the object server, and zbus holds this
+    /// interface's lock for the whole duration of the D-Bus method call —
+    /// awaiting the task here would block it on that same lock and deadlock,
+    /// leaving the entire plugin unresponsive to every further call.
+    pub fn disconnect(&self) {
+        info!("Requesting tunnel shutdown");
+        let _ = self.cancel.send(true);
     }
 }
 
@@ -169,14 +187,53 @@ impl NegotiationStatus for NmNegotiationStatus {
 
 /// Spawn the tunnel task. Returns a handle for controlling it.
 pub async fn spawn_tunnel(profile: ConnectionProfile, conn: Connection) -> TunnelHandle {
-    let shutdown = Arc::new(Notify::new());
-    let shutdown_clone = shutdown.clone();
+    let (cancel, cancel_rx) = watch::channel(false);
     let auth_failed = Arc::new(AtomicBool::new(false));
-    let auth_failed_clone = auth_failed.clone();
+    let auth_failed_task = auth_failed.clone();
+    let cancel_task = cancel_rx.clone();
+
+    // Capture how the VPN server is reached *before* any tunnel exists. Once
+    // the device and its routes are up this information is no longer available.
+    let endpoint =
+        endpoint::resolve_server(&profile.server).and_then(|server| {
+            match endpoint::probe(server) {
+                Ok(route) => {
+                    info!(
+                        "VPN endpoint {} is reached via {} on {}",
+                        route.server,
+                        route
+                            .gateway
+                            .map(|g| g.to_string())
+                            .unwrap_or_else(|| "on-link".into()),
+                        route.device
+                    );
+                    Some(route)
+                }
+                Err(e) => {
+                    warn!("Could not probe the route to {}: {e:#}", server);
+                    None
+                }
+            }
+        });
+    let endpoint_task = endpoint.clone();
 
     tokio::spawn(async move {
-        if let Err(e) = run_tunnel(profile, conn.clone(), shutdown_clone, auth_failed_clone).await {
+        if let Err(e) = run_tunnel(
+            profile,
+            conn.clone(),
+            endpoint_task.clone(),
+            cancel_task,
+            auth_failed_task,
+        )
+        .await
+        {
             error!("Tunnel error: {e:#}");
+            // Never leave an orphaned device behind: it stays persistent in the
+            // kernel and would block the next connect with "File exists".
+            crate::tun_device::delete_tun(TUN_DEVICE_NAME);
+            if let Some(route) = &endpoint_task {
+                endpoint::unpin(route);
+            }
             let reason = if auth_failed.load(Ordering::SeqCst) {
                 nm_vpn_failure::LOGIN_FAILED
             } else {
@@ -186,7 +243,7 @@ pub async fn spawn_tunnel(profile: ConnectionProfile, conn: Connection) -> Tunne
         }
     });
 
-    TunnelHandle { shutdown }
+    TunnelHandle { cancel }
 }
 
 async fn emit_state_changed(conn: &Connection, state: u32) {
@@ -242,7 +299,8 @@ async fn emit_ip4_config(conn: &Connection, config: HashMap<String, OwnedValue>)
 async fn run_tunnel(
     profile: ConnectionProfile,
     conn: Connection,
-    shutdown: Arc<Notify>,
+    endpoint: Option<endpoint::EndpointRoute>,
+    mut cancel: watch::Receiver<bool>,
     auth_failed: Arc<AtomicBool>,
 ) -> Result<()> {
     // Phase 1: TLS + HTTP CONNECT
@@ -271,6 +329,31 @@ async fn run_tunnel(
     // Phase 3: Create TUN device (running as root — no pkexec needed)
     let tun = crate::tun_device::create_tun(TUN_DEVICE_NAME, neg.local_ip, neg.remote_ip, neg.mtu)?;
 
+    // Keep the tunnel's own control path off the tunnel before NM installs a
+    // default route through it. Without this pin, becoming the default route
+    // pulls the SSTP connection to the VPN server into the tunnel that carries
+    // it; the server cannot return that traffic, the TCP connection breaks, and
+    // the tunnel dies while the default route still points at it — leaving no
+    // working network at all.
+    let mut pinned_endpoint = None;
+    if profile.default_gateway {
+        match &endpoint {
+            Some(route) => match endpoint::pin(route) {
+                Ok(()) => {
+                    info!(
+                        "Pinned VPN endpoint {} via {} on {} so it stays outside the tunnel",
+                        route.server,
+                        route.gateway.map(|g| g.to_string()).unwrap_or_default(),
+                        route.device
+                    );
+                    pinned_endpoint = Some(route.clone());
+                }
+                Err(e) => warn!("Failed to pin VPN endpoint: {e:#}"),
+            },
+            None => warn!("Could not determine the route to the VPN server"),
+        }
+    }
+
     // Phase 4: Emit Config and Ip4Config to NM
     let mut config = HashMap::new();
     config.insert(
@@ -297,6 +380,12 @@ async fn run_tunnel(
     );
     emit_config(&conn, config).await;
 
+    // NM rejects a gateway that is not inside the address' own subnet. The
+    // tunnel is point-to-point, so a /32 prefix would make `gateway` invalid
+    // and NM would silently refuse to install the default route. Use the
+    // netmask the router actually negotiated via IPCP.
+    let prefix = ipcp::netmask_to_prefix(neg.netmask).unwrap_or(24);
+
     // NM expects IPv4 addresses as u32 in network byte order (big-endian),
     // but stored as a little-endian u32 value — i.e. the octets are reversed.
     // Ipv4Addr::to_bits() gives big-endian, so we swap to get what NM wants.
@@ -310,16 +399,24 @@ async fn run_tunnel(
     );
     ip4.insert(
         "prefix".to_string(),
-        OwnedValue::try_from(zbus::zvariant::Value::new(32u32))
+        OwnedValue::try_from(zbus::zvariant::Value::new(prefix as u32))
             .expect("NM config value conversion is infallible for primitive types"),
     );
-    ip4.insert(
-        "gateway".to_string(),
-        OwnedValue::try_from(zbus::zvariant::Value::new(
-            neg.remote_ip.to_bits().swap_bytes(),
-        ))
-        .unwrap(),
-    );
+    // Only advertise a gateway when we actually want to become the default
+    // route. NM always installs a host route to an advertised gateway, and it
+    // resolves that gateway over the current default device — which puts the
+    // VPN router on the local link and shadows the tunnel. In split-tunnel
+    // mode the gateway is only an on-link nexthop for the routes below, so
+    // saying nothing keeps the peer bound to the tunnel.
+    if profile.default_gateway {
+        ip4.insert(
+            "gateway".to_string(),
+            OwnedValue::try_from(zbus::zvariant::Value::new(
+                neg.remote_ip.to_bits().swap_bytes(),
+            ))
+            .unwrap(),
+        );
+    }
     if let Some(dns) = neg.dns {
         ip4.insert(
             "dns".to_string(),
@@ -335,13 +432,21 @@ async fn run_tunnel(
         );
     }
 
-    // Build routes: auto-route gateway's /24 subnet if enabled, plus manual routes
+    // Build routes: the tunnel subnet if enabled, then any manual routes.
+    // The peer's own host route comes from the kernel, courtesy of the
+    // point-to-point address set in `create_tun`.
     let mut routes = Vec::new();
     if profile.route_remote_network {
-        let octets = neg.remote_ip.octets();
-        let subnet = format!("{}.{}.{}.0/24", octets[0], octets[1], octets[2]);
-        info!("Auto-routing remote network: {subnet}");
-        routes.push(subnet);
+        match ipcp::network_cidr(neg.local_ip, neg.netmask) {
+            Some(subnet) => {
+                info!("Auto-routing remote network: {subnet}");
+                routes.push(subnet);
+            }
+            None => warn!(
+                "Router sent a non-contiguous netmask ({}), skipping auto-route",
+                neg.netmask
+            ),
+        }
     }
     routes.extend(profile.routes.iter().cloned());
 
@@ -386,7 +491,7 @@ async fn run_tunnel(
         &mut neg.socket_buf,
         &mut fsms,
         addrs,
-        &shutdown,
+        &mut cancel,
         profile.keepalive,
     )
     .await;
@@ -394,6 +499,10 @@ async fn run_tunnel(
     // Teardown
     drop(tun);
     crate::tun_device::delete_tun(TUN_DEVICE_NAME);
+    if let Some(route) = &pinned_endpoint {
+        endpoint::unpin(route);
+        info!("Removed VPN endpoint pin for {}", route.server);
+    }
 
     emit_state_changed(&conn, 5).await; // STOPPING
     emit_state_changed(&conn, 6).await; // STOPPED
@@ -408,12 +517,15 @@ async fn data_loop(
     socket_buf: &mut BytesMut,
     fsms: &mut PppFsmPair,
     addrs: TunnelAddrs,
-    shutdown: &Notify,
+    cancel: &mut watch::Receiver<bool>,
     keepalive_enabled: bool,
 ) -> Result<()> {
     info!("Entering data transfer loop");
     let mut keepalive = KeepaliveTracker::new();
-    let mut tun_buf = vec![0u8; MAX_PACKET_SIZE + 64];
+    // Size from the negotiated MTU. A fixed 1500-byte buffer would panic on
+    // `&tun_buf[..n]`: the kernel reports the true packet length even when the
+    // read did not fit, and MTU is configurable up to 9000.
+    let mut tun_buf = vec![0u8; addrs.mtu as usize + 64];
     let mut read_buf = [0u8; READ_BUF_SIZE];
     let mut stats = TrafficStats::new(addrs.mtu);
     let mut ping = PingKeeper::new(addrs.local_ip, addrs.remote_ip);
@@ -422,6 +534,13 @@ async fn data_loop(
     }
 
     loop {
+        // Catch a stop requested before this loop iteration started, or before
+        // the data loop was even reached.
+        if *cancel.borrow() {
+            info!("Disconnect requested by NM");
+            return Ok(());
+        }
+
         let keepalive_delay = keepalive.next_check_duration();
 
         tokio::select! {
@@ -434,8 +553,12 @@ async fn data_loop(
                     stats.record_tx(n);
                     let ip_packet = &tun_buf[..n];
                     let ppp_frame = PppFrame::ipv4(ip_packet.to_vec());
-                    send_ppp_frame(&ppp_frame, tls_stream).await
-                        .context("Failed to send IP packet to tunnel")?;
+                    if send_ppp_frame_cancellable(&ppp_frame, tls_stream, cancel).await?
+                        == WriteOutcome::Cancelled
+                    {
+                        info!("Disconnect requested by NM");
+                        return Ok(());
+                    }
                 }
             }
 
@@ -473,8 +596,22 @@ async fn data_loop(
 
                     if ppp.is_ipv4() {
                         stats.record_rx(ppp.information.len());
-                        let tun_write: std::io::Result<usize> = tun.send(&ppp.information).await;
-                        tun_write.context("Failed to write to TUN")?;
+                        // Hand the packet to the TUN, but not if a disconnect
+                        // has been requested: a write into a TUN nobody is
+                        // draining would block just as long as a stalled socket.
+                        let pinned = std::pin::Pin::new(tun);
+                        let tun_write = pinned.send(&ppp.information);
+                        tokio::select! {
+                            biased;
+                            result = tun_write => {
+                                let n: std::io::Result<usize> = result;
+                                n.context("Failed to write to TUN")?;
+                            }
+                            _ = cancel.changed() => {
+                                info!("Disconnect requested by NM");
+                                return Ok(());
+                            }
+                        }
                     } else if ppp.is_lcp() {
                         let ctrl = PppControlFrame::parse(&ppp.information)
                             .context("Failed to parse LCP frame")?;
@@ -526,7 +663,7 @@ async fn data_loop(
             }
 
             // Disconnect signal from NM
-            _ = shutdown.notified() => {
+            _ = cancel.changed() => {
                 info!("Disconnect requested by NM");
                 let actions = fsms.lcp.handle_event(FsmEvent::Close);
                 execute_actions(&actions, PPP_LCP, fsms.lcp.tag, tls_stream).await?;

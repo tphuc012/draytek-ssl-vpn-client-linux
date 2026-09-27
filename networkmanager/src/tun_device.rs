@@ -11,7 +11,14 @@ use tracing::{info, warn};
 // ioctl request code for TUNSETIFF
 const TUNSETIFF: libc::c_ulong = 0x400454ca;
 
-/// Create a TUN device, configure its IP and MTU, and bring it up.
+/// Create a TUN device, configure its point-to-point address, and bring it up.
+///
+/// The point-to-point address is set here rather than left to NetworkManager
+/// because the kernel then installs its own host route to the peer
+/// (`<peer> dev <name> scope link`, metric 0). NM insists on managing the
+/// gateway itself and will otherwise resolve it over the *current* default
+/// device, installing a /32 host route to the peer via the local link that
+/// shadows the tunnel and sends traffic for the VPN router the wrong way.
 ///
 /// Returns the async TUN device for read/write. Since we're running as root
 /// (NM spawns VPN plugins as root), no privilege elevation is needed.
@@ -23,16 +30,27 @@ pub fn create_tun(
 ) -> Result<tun_rs::AsyncDevice> {
     info!("Creating TUN device {name}");
 
+    // A previous session that did not tear down cleanly (NM restart, SIGKILL,
+    // crash, or a stuck data loop) leaves the device behind. `ip tuntap add`
+    // then fails with "File exists" and every reconnect dies right here, so
+    // clear the leftover before creating ours.
+    remove_stale_tun(name);
+
     // Create the TUN device using ip commands (we're root)
-    let status = std::process::Command::new("ip")
+    let output = std::process::Command::new("ip")
         .args(["tuntap", "add", "dev", name, "mode", "tun"])
-        .status()
+        .output()
         .context("Failed to run ip tuntap add")?;
-    if !status.success() {
-        anyhow::bail!("ip tuntap add failed with {status}");
+    if !output.status.success() {
+        anyhow::bail!(
+            "ip tuntap add failed ({}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
     }
 
-    // Configure IP address
+    // Configure the point-to-point address, which also creates the kernel host
+    // route to the peer.
     let status = std::process::Command::new("ip")
         .args([
             "addr",
@@ -83,14 +101,44 @@ pub fn create_tun(
     Ok(device)
 }
 
+/// Delete `name` if it still exists, ignoring failures.
+///
+/// Used before creating a device so a leftover from a crashed session cannot
+/// block the next connect attempt.
+fn remove_stale_tun(name: &str) {
+    if !std::path::Path::new(&format!("/sys/class/net/{name}")).exists() {
+        return;
+    }
+    warn!("Removing stale {name} left over from a previous session");
+    let _ = std::process::Command::new("ip")
+        .args(["tuntap", "del", "dev", name, "mode", "tun"])
+        .status();
+}
+
 /// Delete the TUN device.
+///
+/// `ip tuntap del` is the correct way to remove a TUN interface; `ip link
+/// delete` is kept as a fallback in case the device was created another way.
 pub fn delete_tun(name: &str) {
     info!("Deleting TUN device {name}");
-    let result = std::process::Command::new("ip")
+
+    match std::process::Command::new("ip")
+        .args(["tuntap", "del", "dev", name, "mode", "tun"])
+        .status()
+    {
+        Ok(status) if status.success() => {
+            info!("TUN device {name} deleted");
+            return;
+        }
+        Ok(status) => warn!("ip tuntap del {name} exited with {status}"),
+        Err(e) => warn!("Failed to run ip tuntap del {name}: {e}"),
+    }
+
+    match std::process::Command::new("ip")
         .args(["link", "delete", name])
-        .status();
-    match result {
-        Ok(status) if status.success() => info!("TUN device {name} deleted"),
+        .status()
+    {
+        Ok(status) if status.success() => info!("TUN device {name} deleted via ip link delete"),
         Ok(status) => warn!("ip link delete {name} exited with {status}"),
         Err(e) => warn!("Failed to delete TUN device {name}: {e}"),
     }

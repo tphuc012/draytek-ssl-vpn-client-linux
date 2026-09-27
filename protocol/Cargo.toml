@@ -10,7 +10,7 @@ openssl = "0.10"
 tokio-openssl = "0.6"
 
 # Async
-tokio = { version = "1", features = ["rt", "io-util", "time", "sync", "net"] }
+tokio = { version = "1", features = ["rt", "io-util", "time", "sync", "net", "macros", "test-util"] }
 
 # Crypto (MS-CHAPv2 needs MD4, SHA1, DES)
 md4 = "0.10"

@@ -8,12 +8,14 @@ use tracing::{debug, error, info, warn};
 
 use draytek_vpn_protocol::connection;
 use draytek_vpn_protocol::constants::*;
+use draytek_vpn_protocol::endpoint;
 use draytek_vpn_protocol::engine_common::{
     execute_actions, send_ppp_frame, PingKeeper, PppFsmPair, TrafficStats, TunnelAddrs,
 };
 use draytek_vpn_protocol::keepalive::KeepaliveTracker;
 use draytek_vpn_protocol::negotiate::{self, NegotiationStatus};
 use draytek_vpn_protocol::protocol::fsm::FsmEvent;
+use draytek_vpn_protocol::protocol::ipcp;
 use draytek_vpn_protocol::protocol::ppp::PppFrame;
 use draytek_vpn_protocol::protocol::ppp_control::PppControlFrame;
 use draytek_vpn_protocol::protocol::sstp::SstpPacket;
@@ -116,15 +118,47 @@ async fn run_inner(
     };
     let has_dns = neg.dns.is_some();
 
-    // Build routes: auto-route gateway's /24 subnet if enabled, plus manual routes
+    // Build routes: auto-route the tunnel subnet if enabled, plus manual routes
     let mut routes = Vec::new();
     if profile.route_remote_network {
-        let octets = neg.remote_ip.octets();
-        let subnet = format!("{}.{}.{}.0/24", octets[0], octets[1], octets[2]);
-        info!("Auto-routing remote network: {subnet}");
-        routes.push(subnet);
+        match ipcp::network_cidr(neg.local_ip, neg.netmask) {
+            Some(subnet) => {
+                info!("Auto-routing remote network: {subnet}");
+                routes.push(subnet);
+            }
+            None => warn!(
+                "Router sent a non-contiguous netmask ({}), skipping auto-route",
+                neg.netmask
+            ),
+        }
     }
     routes.extend(profile.routes.iter().cloned());
+
+    // Capture how the VPN server is reached *before* any tunnel route exists.
+    // After the default route is installed this information is gone: the server
+    // then looks reachable only through the tunnel carrying it.
+    let endpoint_route = if profile.default_gateway {
+        match endpoint::resolve_server(&profile.server).and_then(|s| endpoint::probe(s).ok()) {
+            Some(route) => {
+                info!(
+                    "VPN endpoint {} is reached via {} on {}",
+                    route.server,
+                    route
+                        .gateway
+                        .map(|g| g.to_string())
+                        .unwrap_or_else(|| "on-link".into()),
+                    route.device
+                );
+                Some(route)
+            }
+            None => {
+                warn!("Could not determine the route to the VPN server");
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     privilege::setup(
         TUN_DEVICE_NAME,
@@ -138,6 +172,16 @@ async fn run_inner(
     .await
     .context("Privileged tunnel setup failed")?;
 
+    // `setup` has just installed the default route, so the VPN server's own
+    // traffic is already being pulled into the tunnel. Pin it back onto the
+    // physical link straight away: this pin is what keeps the SSTP connection
+    // carrying the tunnel alive.
+    if let Some(route) = &endpoint_route {
+        if let Err(e) = privilege::pin_endpoint(route).await {
+            warn!("Failed to pin VPN endpoint: {e:#}");
+        }
+    }
+
     // Open TUN device (unprivileged — helper created it with user ownership)
     let tun = match tun_device::open_tun(TUN_DEVICE_NAME) {
         Ok(t) => t,
@@ -150,8 +194,7 @@ async fn run_inner(
 
     // Compute routing info for the UI
     let remote_network_route = if profile.route_remote_network {
-        let octets = neg.remote_ip.octets();
-        Some(format!("{}.{}.{}.0/24", octets[0], octets[1], octets[2]))
+        ipcp::network_cidr(neg.local_ip, neg.netmask)
     } else {
         None
     };
@@ -195,6 +238,9 @@ async fn run_inner(
     // Always tear down the privileged resources
     status_tx.send(TunnelStatus::Disconnecting);
     privilege::teardown(TUN_DEVICE_NAME, has_dns).await;
+    if let Some(route) = &endpoint_route {
+        privilege::unpin_endpoint(route.server).await;
+    }
 
     data_result
 }
@@ -211,7 +257,10 @@ async fn data_loop(
 ) -> Result<()> {
     info!("Entering data transfer loop");
     let mut keepalive = KeepaliveTracker::new();
-    let mut tun_buf = vec![0u8; MAX_PACKET_SIZE + 64];
+    // Size from the negotiated MTU. A fixed 1500-byte buffer would panic on
+    // `&tun_buf[..n]`: the kernel reports the true packet length even when the
+    // read did not fit, and MTU is configurable up to 9000.
+    let mut tun_buf = vec![0u8; addrs.mtu as usize + 64];
     let mut read_buf = [0u8; READ_BUF_SIZE];
     let mut stats = TrafficStats::new(addrs.mtu);
     let mut ping = PingKeeper::new(addrs.local_ip, addrs.remote_ip);

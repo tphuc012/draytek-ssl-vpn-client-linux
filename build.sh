@@ -10,7 +10,7 @@
 # Usage:
 #   ./build.sh app                    Build standalone app (debug)
 #   ./build.sh app release            Build standalone app (release)
-#   ./build.sh app install            Build release + install polkit policy
+#   ./build.sh app install            Build release + install app, helper, polkit policy
 #   ./build.sh app run                Build debug + launch the app
 #   ./build.sh nm                     Build NM plugin (debug)
 #   ./build.sh nm release             Build NM plugin (release)
@@ -50,6 +50,9 @@ detect_nm_plugin_dir() {
 }
 
 POLKIT_DIR="/usr/share/polkit-1/actions"
+APP_LIB_DIR="/usr/lib/draytek-vpn"
+APP_BIN_DIR="/usr/bin"
+APP_DESKTOP_DIR="/usr/share/applications"
 NM_PLUGIN_DIR="$(detect_nm_plugin_dir)"
 NM_VPN_DIR="/usr/lib/NetworkManager/VPN"
 NM_SERVICE_DIR="/usr/lib/NetworkManager"
@@ -89,9 +92,26 @@ app_install() {
     app_build release
 
     header "Install App"
-    info "Installing polkit policy (requires sudo)"
+    info "Installing app + helper (requires sudo)"
+
+    # The helper must land at $APP_LIB_DIR/draytek-vpn-helper: that is the path
+    # the polkit policy annotates and the last fallback in
+    # standalone/src/tunnel/privilege.rs::find_helper.
+    sudo install -d -m 755 "$APP_LIB_DIR"
+    sudo install -m 755 target/release/draytek-vpn-helper "$APP_LIB_DIR/"
+    sudo install -m 755 target/release/draytek-vpn "$APP_BIN_DIR/"
+
+    info "Installing polkit policy"
     sudo install -m 644 standalone/data/com.draytek.vpn.policy "$POLKIT_DIR/"
-    info "Done. Run with: cargo run --bin draytek-vpn"
+
+    info "Installing desktop entry"
+    sudo install -m 644 standalone/data/draytek-vpn.desktop "$APP_DESKTOP_DIR/"
+
+    if command -v update-desktop-database &>/dev/null; then
+        sudo update-desktop-database "$APP_DESKTOP_DIR" || true
+    fi
+
+    info "Done. Launch with: draytek-vpn"
 }
 
 app_run() {

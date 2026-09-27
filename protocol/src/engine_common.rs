@@ -4,7 +4,7 @@ use anyhow::{bail, Context, Result};
 use std::net::Ipv4Addr;
 use std::pin::Pin;
 use tokio::io::AsyncWriteExt;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::protocol::fsm::{FsmAction, PppFsm};
 use crate::protocol::ppp::PppFrame;
@@ -35,6 +35,49 @@ pub async fn send_ppp_frame<S: tokio::io::AsyncWrite + Unpin>(
         .context("Failed to write PPP frame to TLS stream")?;
     Ok(())
 }
+
+/// Outcome of a write that can be abandoned on disconnect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteOutcome {
+    /// The whole frame was written.
+    Sent,
+    /// A disconnect was requested first; the write was abandoned.
+    Cancelled,
+}
+
+/// Send a PPP frame, giving up if a disconnect arrives or the peer stops reading.
+///
+/// A bare `write_all` can block for a full TCP retransmission timeout when the
+/// far end has stopped reading. A future stuck inside a `select!` branch body is
+/// not interrupted by the cancel channel, so shutdown then takes tens of
+/// seconds — long enough for NM to time the VPN out and delete the TUN device
+/// underneath us. Racing the write against the cancel signal (and a timeout)
+/// keeps teardown responsive whatever the data path is doing.
+pub async fn send_ppp_frame_cancellable<S: tokio::io::AsyncWrite + Unpin>(
+    frame: &PppFrame,
+    stream: &mut S,
+    cancel: &mut tokio::sync::watch::Receiver<bool>,
+) -> Result<WriteOutcome> {
+    let bytes = frame.to_sstp_bytes();
+    let mut pinned = Pin::new(stream);
+    let write = pinned.write_all(&bytes);
+
+    tokio::select! {
+        biased;
+        result = write => {
+            result.context("Failed to write PPP frame to TLS stream")?;
+            Ok(WriteOutcome::Sent)
+        }
+        _ = cancel.changed() => Ok(WriteOutcome::Cancelled),
+        () = tokio::time::sleep(std::time::Duration::from_secs(WRITE_TIMEOUT_SECS)) => {
+            warn!("write timed out after {WRITE_TIMEOUT_SECS}s, abandoning frame");
+            Ok(WriteOutcome::Cancelled)
+        }
+    }
+}
+
+/// How long a single tunnel write may block before it is abandoned.
+const WRITE_TIMEOUT_SECS: u64 = 10;
 
 /// Execute FSM actions: send frames and check for shutdown/layer-up.
 pub async fn execute_actions<S: tokio::io::AsyncWrite + Unpin>(
@@ -242,5 +285,89 @@ impl PingKeeper {
         self.seq = self.seq.wrapping_add(1);
         self.last_sent = tokio::time::Instant::now();
         Some(frame)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::constants::SSTP_CMD_DATA;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncReadExt, AsyncWrite};
+
+    fn frame() -> PppFrame {
+        PppFrame::ipv4(vec![0x45, 0x00, 0x00, 0x1c])
+    }
+
+    /// Stands in for a peer that has stopped reading: every write stays pending
+    /// forever. This is the case that used to wedge shutdown for tens of
+    /// seconds while a TCP retransmission timeout ran out.
+    struct StalledWriter;
+
+    impl AsyncWrite for StalledWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Pending
+        }
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Pending
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellable_write_reports_sent_when_stream_accepts() {
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        let (tx, mut rx) = tokio::sync::watch::channel(false);
+        drop(tx);
+
+        let outcome = send_ppp_frame_cancellable(&frame(), &mut client, &mut rx)
+            .await
+            .expect("write should succeed");
+        assert_eq!(outcome, WriteOutcome::Sent);
+
+        let mut head = [0u8; 1];
+        server.read_exact(&mut head).await.unwrap();
+        assert_eq!(head[0], SSTP_CMD_DATA);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancellable_write_gives_up_on_disconnect() {
+        let (tx, mut rx) = tokio::sync::watch::channel(false);
+        let mut writer = StalledWriter;
+
+        let task = tokio::spawn(async move {
+            send_ppp_frame_cancellable(&frame(), &mut writer, &mut rx).await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tx.send(true).unwrap();
+
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("write ignored the disconnect request")
+            .expect("task panicked")
+            .expect("write should not have errored");
+        assert_eq!(outcome, WriteOutcome::Cancelled);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancellable_write_gives_up_when_the_peer_stalls() {
+        let (tx, mut rx) = tokio::sync::watch::channel(false);
+        drop(tx);
+        let mut writer = StalledWriter;
+
+        // Paused time means the timeout fires immediately, so this asserts the
+        // abandonment path without actually waiting WRITE_TIMEOUT_SECS.
+        let outcome = send_ppp_frame_cancellable(&frame(), &mut writer, &mut rx)
+            .await
+            .expect("write should not have errored");
+        assert_eq!(outcome, WriteOutcome::Cancelled);
     }
 }
