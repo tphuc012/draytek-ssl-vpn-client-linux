@@ -8,7 +8,7 @@ use std::process::{Command, ExitCode};
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: draytek-vpn-helper <setup|teardown|check> [options]");
+        eprintln!("Usage: draytek-vpn-helper <setup|teardown|check|pin-endpoint> [options]");
         return ExitCode::from(1);
     }
 
@@ -17,7 +17,6 @@ fn main() -> ExitCode {
         "teardown" => cmd_teardown(&args[2..]),
         "check" => cmd_check(),
         "pin-endpoint" => cmd_pin_endpoint(&args[2..]),
-        "unpin-endpoint" => cmd_unpin_endpoint(&args[2..]),
         other => {
             eprintln!("Unknown subcommand: {other}");
             Err("Unknown subcommand".into())
@@ -305,10 +304,13 @@ fn try_resolvectl_dns_setup(device: &str, dns_ip: Ipv4Addr) -> bool {
     true
 }
 
+/// Where the direct-write DNS fallback stashes the original resolv.conf.
+const RESOLV_BACKUP_PATH: &str = "/run/draytek-vpn-resolv.bak";
+
 /// Configure DNS by writing directly to /etc/resolv.conf (requires root).
 fn direct_dns_setup(dns_ip: Ipv4Addr) -> Result<(), Box<dyn std::error::Error>> {
     let resolv_path = "/etc/resolv.conf";
-    let backup_path = "/run/draytek-vpn-resolv.bak";
+    let backup_path = RESOLV_BACKUP_PATH;
 
     // Backup current resolv.conf
     if let Ok(current) = std::fs::read_to_string(resolv_path) {
@@ -377,6 +379,16 @@ fn cmd_pin_endpoint(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     })
 }
 
+/// Where the current pin is recorded, so teardown can undo it without being told
+/// what to undo.
+///
+/// The pin outlives any single process: it is a host route in the kernel, and
+/// nothing removes it when the app is killed. Recording it here means the single
+/// teardown path owns both the device and the pin, so no caller has to remember
+/// to clean up after itself, and a session that died mid-setup still gets its
+/// pin removed by the next run.
+const PIN_STATE_PATH: &str = "/run/draytek-vpn-pin";
+
 /// Install the host route that keeps the VPN server outside the tunnel.
 fn install_pin(pin: &PinArgs) -> Result<(), Box<dyn std::error::Error>> {
     let cidr = format!("{}/32", pin.ip);
@@ -390,36 +402,31 @@ fn install_pin(pin: &PinArgs) -> Result<(), Box<dyn std::error::Error>> {
     let borrowed: Vec<&str> = owned.iter().map(String::as_str).collect();
 
     run_cmd("ip", &borrowed)?;
+    // Record only once the route is actually in place, so the state file never
+    // advertises a pin that does not exist.
+    if let Err(e) = std::fs::write(PIN_STATE_PATH, &cidr) {
+        eprintln!("Warning: failed to record pin state in {PIN_STATE_PATH}: {e}");
+    }
     eprintln!("Pinned VPN endpoint {cidr} on {}", pin.device);
     Ok(())
 }
 
-/// Remove a pin created by `pin-endpoint`. Best-effort.
-fn cmd_unpin_endpoint(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    let mut server = None;
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--ip" => {
-                i += 1;
-                server = Some(
-                    args.get(i)
-                        .ok_or("--ip requires a value")?
-                        .parse::<Ipv4Addr>()?,
-                );
-            }
-            other => return Err(format!("Unknown option: {other}").into()),
-        }
-        i += 1;
+/// Remove the pin recorded in [`PIN_STATE_PATH`], if any. Best-effort.
+fn remove_recorded_pin() {
+    let Ok(cidr) = std::fs::read_to_string(PIN_STATE_PATH) else {
+        return;
+    };
+    let cidr = cidr.trim();
+    if cidr.is_empty() {
+        let _ = std::fs::remove_file(PIN_STATE_PATH);
+        return;
     }
-    let server = server.ok_or("--ip is required")?;
-    let cidr = format!("{server}/32");
-    if let Err(e) = run_cmd("ip", &["route", "del", &cidr]) {
-        eprintln!("Warning: failed to remove endpoint pin: {e}");
+    if let Err(e) = run_cmd("ip", &["route", "del", cidr]) {
+        eprintln!("Warning: failed to remove endpoint pin {cidr}: {e}");
     } else {
-        eprintln!("Removed VPN endpoint pin {cidr}");
+        eprintln!("+ Removed VPN endpoint pin {cidr}");
     }
-    Ok(())
+    let _ = std::fs::remove_file(PIN_STATE_PATH);
 }
 
 fn cmd_setup(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
@@ -518,6 +525,10 @@ fn cmd_setup(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(dns_ip) = setup.dns {
         if try_resolvectl_dns_setup(&setup.device, dns_ip) {
             eprintln!("DNS configured via resolvectl for {}", setup.device);
+            // A backup from a session that crashed can only be a record of a
+            // resolv.conf we are no longer using. Leaving it for teardown to
+            // restore would overwrite the current file with a stale copy.
+            let _ = std::fs::remove_file(RESOLV_BACKUP_PATH);
         } else {
             eprintln!("resolvectl not available or failed, falling back to /etc/resolv.conf");
             match direct_dns_setup(dns_ip) {
@@ -585,7 +596,13 @@ fn cmd_teardown(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("Warning: failed to delete {}: {e}", teardown.device);
     }
 
-    // 4. Restore DNS (try both methods — safe no-ops if nothing to do)
+    // 4. Remove the endpoint pin (see PIN_STATE_PATH). Done unconditionally:
+    //    the route is not tied to the device, so deleting the device above does
+    //    not take it with it, and a pin left behind keeps sending the VPN
+    //    server's traffic down a gateway from whatever network is current.
+    remove_recorded_pin();
+
+    // 5. Restore DNS (try both methods — safe no-ops if nothing to do)
     if teardown.restore_dns {
         // Try resolvectl revert (no-op if resolvectl wasn't used or device is gone)
         match Command::new("resolvectl")
@@ -601,7 +618,7 @@ fn cmd_teardown(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // Restore /etc/resolv.conf backup if it exists (covers direct-write case)
-        let backup_path = "/run/draytek-vpn-resolv.bak";
+        let backup_path = RESOLV_BACKUP_PATH;
         let resolv_path = "/etc/resolv.conf";
         if std::path::Path::new(backup_path).exists() {
             match std::fs::read_to_string(backup_path) {
@@ -622,4 +639,160 @@ fn cmd_teardown(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
     eprintln!("Teardown complete for {}", teardown.device);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// A setup that pins the endpoint is only safe if the pin really is
+    /// requested: an accidental `None` here is a tunnel that swallows its own
+    /// control connection, and it fails silently.
+    #[test]
+    fn pin_is_parsed_together() {
+        let parsed = parse_setup_args(&args(&[
+            "--device",
+            "draytek0",
+            "--uid",
+            "1000",
+            "--local-ip",
+            "192.168.1.104",
+            "--peer-ip",
+            "192.168.1.1",
+            "--mtu",
+            "1280",
+            "--pin-ip",
+            "117.2.126.196",
+            "--pin-device",
+            "wlo1",
+            "--pin-gateway",
+            "192.168.1.1",
+        ]))
+        .expect("setup args should parse");
+
+        let pin = parsed.pin.expect("pin should be present");
+        assert_eq!(pin.ip, Ipv4Addr::new(117, 2, 126, 196));
+        assert_eq!(pin.device, "wlo1");
+        assert_eq!(pin.gateway, Some(Ipv4Addr::new(192, 168, 1, 1)));
+    }
+
+    #[test]
+    fn pin_is_absent_when_not_requested() {
+        let parsed = parse_setup_args(&args(&[
+            "--device",
+            "draytek0",
+            "--uid",
+            "1000",
+            "--local-ip",
+            "192.168.1.104",
+            "--peer-ip",
+            "192.168.1.1",
+            "--mtu",
+            "1280",
+        ]))
+        .expect("setup args should parse");
+        assert!(parsed.pin.is_none());
+    }
+
+    /// Half a pin installs nothing and fails silently, which is the failure this
+    /// rejects: the tunnel would then route the SSTP connection into itself.
+    #[test]
+    fn half_a_pin_is_rejected() {
+        let device_only = parse_setup_args(&args(&[
+            "--device",
+            "draytek0",
+            "--uid",
+            "1000",
+            "--local-ip",
+            "192.168.1.104",
+            "--peer-ip",
+            "192.168.1.1",
+            "--mtu",
+            "1280",
+            "--pin-device",
+            "wlo1",
+        ]))
+        .err()
+        .map(|e| e.to_string())
+        .expect("pin without an address should be rejected");
+        assert!(device_only.contains("--pin-ip"), "{device_only}");
+
+        let address_only = parse_setup_args(&args(&[
+            "--device",
+            "draytek0",
+            "--uid",
+            "1000",
+            "--local-ip",
+            "192.168.1.104",
+            "--peer-ip",
+            "192.168.1.1",
+            "--mtu",
+            "1280",
+            "--pin-ip",
+            "117.2.126.196",
+        ]))
+        .err()
+        .map(|e| e.to_string())
+        .expect("pin without a device should be rejected");
+        assert!(address_only.contains("--pin-device"), "{address_only}");
+    }
+
+    #[test]
+    fn physical_interface_names_are_accepted() {
+        // The TUN name is short and alphanumeric; real interface names are not,
+        // and rejecting them would make the pin impossible to install.
+        for name in [
+            "wlo1", "eth0", "enp3s0", "wlp3s0", "br-lan", "veth0_1", "en0.100",
+        ] {
+            validate_iface_name(name).unwrap_or_else(|e| panic!("{name} should be valid: {e}"));
+        }
+        for name in ["", "wlo1;reboot", "eth 0", "a/b", "$(id)"] {
+            assert!(
+                validate_iface_name(name).is_err(),
+                "{name} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn tun_device_name_stays_restricted() {
+        validate_device_name("draytek0").expect("the TUN name is valid");
+        // Anything wider belongs to validate_iface_name, not here: this guards
+        // the name we hand to `ip tuntap add`.
+        assert!(validate_device_name("br-lan").is_err());
+        assert!(validate_device_name("0tun").is_err());
+    }
+
+    #[test]
+    fn default_gateway_and_routes_survive_parsing() {
+        let parsed = parse_setup_args(&args(&[
+            "--device",
+            "draytek0",
+            "--uid",
+            "1000",
+            "--local-ip",
+            "192.168.1.104",
+            "--peer-ip",
+            "192.168.1.1",
+            "--mtu",
+            "1280",
+            "--default-gw",
+            "192.168.1.1",
+            "--dns",
+            "116.97.90.124",
+            "--route",
+            "192.168.1.0/24",
+            "--route",
+            "115.73.220.127/32",
+        ]))
+        .expect("setup args should parse");
+
+        assert_eq!(parsed.default_gw, Some(Ipv4Addr::new(192, 168, 1, 1)));
+        assert_eq!(parsed.dns, Some(Ipv4Addr::new(116, 97, 90, 124)));
+        assert_eq!(parsed.routes, vec!["192.168.1.0/24", "115.73.220.127/32"]);
+    }
 }

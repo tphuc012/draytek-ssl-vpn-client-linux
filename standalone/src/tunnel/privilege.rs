@@ -24,6 +24,17 @@ pub fn has_dns_backup() -> bool {
     std::path::Path::new("/run/draytek-vpn-resolv.bak").exists()
 }
 
+/// Check whether a previous session left an endpoint pin behind.
+///
+/// The pin is a host route, not device state, so it survives the tunnel device
+/// being deleted. Left alone it keeps routing the VPN server down a gateway
+/// belonging to whatever network the machine is on now, so a later connect fails
+/// with no visible cause. Worth surfacing on its own, not just alongside a stale
+/// device.
+pub fn has_stale_pin() -> bool {
+    std::path::Path::new("/run/draytek-vpn-pin").exists()
+}
+
 /// Find the helper binary path.
 ///
 /// Resolution order:
@@ -108,30 +119,6 @@ fn needs_pkexec() -> bool {
             }
         }
     })
-}
-
-/// Remove a pin installed as part of [`setup`]. Best-effort.
-pub async fn unpin_endpoint(server: Ipv4Addr) {
-    let helper = match find_helper() {
-        Ok(h) => h,
-        Err(e) => {
-            warn!("Cannot find helper to remove endpoint pin: {e:#}");
-            return;
-        }
-    };
-    let args = vec![
-        helper,
-        "unpin-endpoint".to_string(),
-        "--ip".to_string(),
-        server.to_string(),
-    ];
-    match run_helper(args).await {
-        Ok(output) if !output.status.success() => {
-            warn!("Failed to remove VPN endpoint pin (exit {})", output.status);
-        }
-        Ok(_) => {}
-        Err(e) => warn!("Failed to run helper to remove endpoint pin: {e:#}"),
-    }
 }
 
 /// Run the helper binary, using pkexec only if the helper lacks CAP_NET_ADMIN.

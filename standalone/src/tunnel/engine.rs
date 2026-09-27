@@ -164,7 +164,7 @@ async fn run_inner(
 
     // The helper pins the endpoint itself, before the default route goes in, so
     // the two can never be reordered by a privilege-elevation prompt.
-    privilege::setup(privilege::SetupRequest {
+    if let Err(e) = privilege::setup(privilege::SetupRequest {
         device: TUN_DEVICE_NAME,
         local_ip: neg.local_ip,
         peer_ip: neg.remote_ip,
@@ -175,7 +175,16 @@ async fn run_inner(
         pin: endpoint_route.as_ref(),
     })
     .await
-    .context("Privileged tunnel setup failed")?;
+    {
+        // A setup that failed partway through still owns system state: the
+        // device, the routes, possibly the default route, and the endpoint pin.
+        // Returning here without undoing any of it leaves the machine routing
+        // traffic at a tunnel that will never run — which is far worse than not
+        // connecting at all.
+        error!("Privileged tunnel setup failed, rolling back: {e:#}");
+        privilege::teardown(TUN_DEVICE_NAME, has_dns).await;
+        return Err(e).context("Privileged tunnel setup failed");
+    }
 
     // Open TUN device (unprivileged — helper created it with user ownership)
     let tun = match tun_device::open_tun(TUN_DEVICE_NAME) {
@@ -233,12 +242,10 @@ async fn run_inner(
     // Close TUN fd before teardown — kernel rejects device deletion while fd is open
     drop(tun);
 
-    // Always tear down the privileged resources
+    // Always tear down the privileged resources. This also removes the endpoint
+    // pin: the helper records what it pinned, so one path owns both.
     status_tx.send(TunnelStatus::Disconnecting);
     privilege::teardown(TUN_DEVICE_NAME, has_dns).await;
-    if let Some(route) = &endpoint_route {
-        privilege::unpin_endpoint(route.server).await;
-    }
 
     data_result
 }

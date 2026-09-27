@@ -333,24 +333,49 @@ impl MainWindow {
             });
         }
 
-        // Check for stale tunnel device from a previous crashed session
+        // Check for leftovers from a previous session that did not shut down
+        // cleanly. The endpoint pin is checked separately from the device: it is
+        // a host route, so it outlives the tunnel interface and can break
+        // connecting on a network the stale route has nothing to do with.
         {
             use crate::tunnel::privilege;
 
-            if privilege::is_device_present(privilege::TUN_DEVICE_NAME) {
-                let restore_dns = privilege::has_dns_backup();
+            let device_present = privilege::is_device_present(privilege::TUN_DEVICE_NAME);
+            let pin_present = privilege::has_stale_pin();
+            let restore_dns = privilege::has_dns_backup();
+
+            if device_present || pin_present {
                 info!(
-                    "Stale tunnel detected: device {} present, DNS backup {}",
+                    "Stale tunnel detected: device {} {present}, endpoint pin {pin}, \
+                     DNS backup {dns}",
                     privilege::TUN_DEVICE_NAME,
-                    if restore_dns { "found" } else { "not found" },
+                    present = if device_present { "present" } else { "gone" },
+                    pin = if pin_present { "present" } else { "gone" },
+                    dns = if restore_dns { "found" } else { "not found" },
                 );
+
+                let body = match (device_present, pin_present) {
+                    (true, true) => {
+                        "A tunnel device (draytek0) and a route keeping the VPN server outside \
+                         the tunnel are both left over from a previous session. \
+                         This may affect your network. Clean them up?"
+                    }
+                    (true, false) => {
+                        "A tunnel device (draytek0) from a previous session is still active. \
+                         This may affect your network. Clean it up?"
+                    }
+                    // No device, but the pin alone still sends the VPN server's
+                    // traffic down a gateway from a network you may no longer be on.
+                    _ => {
+                        "A route keeping the VPN server outside the tunnel is left over from \
+                         a previous session. It points at the network you were on then, so \
+                         connecting from a different network will fail. Clean it up?"
+                    }
+                };
 
                 let dialog = adw::AlertDialog::builder()
                     .heading("Stale Tunnel Detected")
-                    .body(
-                        "A tunnel device (draytek0) from a previous session is still active. \
-                         This may affect your network. Clean it up?",
-                    )
+                    .body(body)
                     .build();
                 dialog.add_response("ignore", "Ignore");
                 dialog.add_response("cleanup", "Clean Up");
