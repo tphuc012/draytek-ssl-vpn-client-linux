@@ -24,11 +24,14 @@ The project has two main applications and a shared protocol library:
 
 ### GUI App (`standalone/`)
 
-A standalone GTK4/libadwaita application for managing VPN connections. Saves connection profiles locally and provides a log view for debugging.
+A GTK4/libadwaita front end for the NetworkManager plugin. It lists the DrayTek VPN connections NM knows about, activates and deactivates them, and shows the state NM reports — along with a log view.
+
+It **owns no tunnel**. It does not negotiate, authenticate, create TUN devices or install routes; those all belong to the NM plugin, which runs as root under NetworkManager. That means the app needs no privileges at all: no helper binary, no Polkit policy, no stored credentials. Add and edit connections in Settings → Network → VPN, where the plugin's own editor is.
+
+The point of sharing one path is that the app, the tray and GNOME Settings all read the same connection, so they cannot disagree about whether the VPN is up. When the app ran a tunnel of its own, it reported "disconnected" while NM was connected, and offered to clean up a device NM was using.
 
 - **Main thread** runs the GTK4/GLib event loop (UI)
-- **Background thread** runs a Tokio async runtime for TLS, TUN I/O, and timers
-- **Privilege separation**: network operations (TUN device creation, routing, DNS) run in a separate `draytek-vpn-helper` binary elevated via Polkit (`pkexec`), so the GUI itself never runs as root
+- **Background thread** runs a Tokio async runtime for the NM D-Bus calls and timers
 
 ### NetworkManager Plugin (`networkmanager/`)
 
@@ -94,7 +97,7 @@ Everything is managed through `./build.sh`:
 
 | Target | What it builds |
 |--------|----------------|
-| `app` | GUI app + privileged helper |
+| `app` | GUI app (an NM front end) |
 | `nm` | NetworkManager plugin (Rust service + C editor + C auth-dialog) |
 | `tray` | System tray indicator binary (installed automatically by `nm install`, use this to rebuild the binary only) |
 | `arch` | Arch Linux package via `makepkg` (wraps `packaging/arch/PKGBUILD`) |
@@ -186,13 +189,15 @@ Install build dependencies before building:
 ./build.sh app run
 ```
 
-Create a connection profile in the GUI, enter your router's address and credentials, and click Connect. A desktop password prompt (Polkit) will appear to authorize network operations.
+The app drives the NetworkManager plugin, so create the connection first — in
+Settings → Network → VPN, or with `nmcli connection add` (see
+[NM Configuration Keys](#networkmanager-configuration-keys)). The app's dropdown
+then lists it; pick it and press Connect.
 
-**Optional**: Install the Polkit policy for a nicer auth dialog with credential caching:
-
-```bash
-sudo cp standalone/data/com.draytek.vpn.policy /usr/share/polkit-1/actions/
-```
+No password prompt is needed to connect. NetworkManager runs the VPN plugin as
+root, and if the connection is stored with `password-flags` asking for a
+secret, your desktop's secret agent supplies the password. The app never sees or
+stores it.
 
 ### Option 2: NetworkManager
 
@@ -263,16 +268,16 @@ draytek-vpn/
 │           ├── lcp.rs / ipcp.rs    #     LCP + IPCP options
 │           └── auth/               #     PAP + MS-CHAPv2
 │
+├── nmapi/                          # Shared NM D-Bus client (Rust)
+│   └── src/lib.rs                  #   monitor_vpn, connect/disconnect, VpnState
+│
 ├── standalone/                     # GUI application (Rust, GTK4/libadwaita)
 │   ├── src/
 │   │   ├── app.rs                  #   Application entry point
-│   │   ├── ui/                     #   Window, profile editor, connection view
-│   │   ├── tunnel/                 #   Tunnel orchestrator, TUN device
-│   │   ├── config.rs               #   Profile persistence
-│   │   └── bin/
-│   │       └── draytek-vpn-helper.rs #   Privileged helper (runs via pkexec)
+│   │   ├── nm_bridge.rs            #   nmapi → GTK bridge, sysfs traffic counters
+│   │   ├── messages.rs             #   StatusView: flat render model from NM state
+│   │   └── ui/                     #   Window, connection view, log view
 │   ├── data/
-│   │   ├── com.draytek.vpn.policy  # Polkit policy for GUI app
 │   │   └── draytek-vpn.desktop     # Desktop entry for app launchers
 │   └── build_appimage.sh           # AppImage builder
 │

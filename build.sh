@@ -2,7 +2,7 @@
 # Build & install script for DrayTek SSL VPN Client.
 #
 # Targets:
-#   app  — Standalone GTK4 app (draytek-vpn + draytek-vpn-helper)
+#   app  — Standalone GTK4 app (draytek-vpn, an NM front end)
 #   nm   — NetworkManager plugin (service, editor .so, auth-dialog)
 #   tray — System tray indicator (draytek-vpn-tray)
 #   all  — All of the above
@@ -80,29 +80,23 @@ app_build() {
     [ "$profile" = "release" ] && flags="--release"
 
     header "Standalone App ($profile)"
-    info "Building draytek-vpn + draytek-vpn-helper"
+    info "Building draytek-vpn"
     cargo build -p draytek-vpn $flags
 
     info "Artifacts:"
     echo "  target/$profile/draytek-vpn"
-    echo "  target/$profile/draytek-vpn-helper"
 }
 
 app_install() {
     app_build release
 
     header "Install App"
-    info "Installing app + helper (requires sudo)"
+    info "Installing app (requires sudo)"
 
-    # The helper must land at $APP_LIB_DIR/draytek-vpn-helper: that is the path
-    # the polkit policy annotates and the last fallback in
-    # standalone/src/tunnel/privilege.rs::find_helper.
-    sudo install -d -m 755 "$APP_LIB_DIR"
-    sudo install -m 755 target/release/draytek-vpn-helper "$APP_LIB_DIR/"
+    # The app holds no tunnel and needs no privileges: it drives NetworkManager
+    # over the session bus, and the VPN plugin does the privileged work as root
+    # under NM. No helper, no polkit policy.
     sudo install -m 755 target/release/draytek-vpn "$APP_BIN_DIR/"
-
-    info "Installing polkit policy"
-    sudo install -m 644 standalone/data/com.draytek.vpn.policy "$POLKIT_DIR/"
 
     info "Installing desktop entry"
     sudo install -m 644 standalone/data/draytek-vpn.desktop "$APP_DESKTOP_DIR/"
@@ -110,6 +104,11 @@ app_install() {
     if command -v update-desktop-database &>/dev/null; then
         sudo update-desktop-database "$APP_DESKTOP_DIR" || true
     fi
+
+    # Clean up what older versions installed, so a stale helper and policy do
+    # not linger and imply the app still needs root.
+    sudo rm -f "$APP_LIB_DIR/draytek-vpn-helper" "$POLKIT_DIR/com.draytek.vpn.policy"
+    sudo rmdir --ignore-fail-on-non-empty "$APP_LIB_DIR" 2>/dev/null || true
 
     info "Done. Launch with: draytek-vpn"
 }

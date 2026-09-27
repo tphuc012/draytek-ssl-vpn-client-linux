@@ -10,6 +10,8 @@ path = "src/main.rs"
 
 [dependencies]
 ksni = "0.3"
+# Shared NetworkManager observation, also used by the standalone client
+draytek-vpn-nmapi = { path = "../nmapi" }
 zbus = { version = "5", features = ["tokio"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "fs", "sync"] }
 tracing = "0.1"

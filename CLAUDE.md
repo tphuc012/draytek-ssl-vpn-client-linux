@@ -4,12 +4,19 @@ Native Linux SSL VPN client for DrayTek routers. Same protocol as the Windows Sm
 
 ## Workspace Layout
 
-Cargo workspace with four members:
+Cargo workspace with five members:
 
-- `protocol/` — `draytek-vpn-protocol` lib: TLS connect, SSTP framing, PPP FSM, LCP/IPCP/auth (PAP + MS-CHAPv2), keepalive. Used by all binaries.
-- `standalone/` — `draytek-vpn` GTK4/libadwaita desktop app + `draytek-vpn-helper` (Polkit-elevated for TUN/routes/DNS). `standalone/src/tunnel/engine.rs` is the GUI data loop.
-- `networkmanager/` — `draytek-vpn-nm` VPN plugin on the system D-Bus (runs as root under NM). GTK3/GTK4 editor `.so` and auth-dialog are C (`networkmanager/editor/`, `networkmanager/auth-dialog/`). `networkmanager/src/tunnel.rs` is the NM data loop.
-- `networkmanagertray/` — `draytek-vpn-tray` ksni StatusNotifier tray. Watches NM over D-Bus (`nm_monitor.rs`), renders via `tray_impl.rs`. Autostarts on session login via `networkmanagertray/data/draytek-vpn-tray.desktop` installed to `/etc/xdg/autostart/`. Single-instance via the well-known session-bus name `com.draytek.vpn.Tray` (DoNotQueue): second invocation exits cleanly.
+- `protocol/` — `draytek-vpn-protocol` lib: TLS connect, SSTP framing, PPP FSM, LCP/IPCP/auth (PAP + MS-CHAPv2), keepalive. Used by the VPN plugin.
+- `networkmanager/` — `draytek-vpn-nm` VPN plugin on the system D-Bus (runs as root under NM). **The only component that builds a tunnel.** GTK3/GTK4 editor `.so` and auth-dialog are C (`networkmanager/editor/`, `networkmanager/auth-dialog/`). `networkmanager/src/tunnel.rs` is the data loop.
+- `nmapi/` — `draytek-vpn-nmapi` lib: reading and driving NetworkManager's DrayTek VPN over D-Bus (`monitor_vpn`, `connect_vpn`, `disconnect_vpn`, `VpnState`). Shared by the two front ends.
+- `standalone/` — `draytek-vpn` GTK4/libadwaita desktop app. A **front end for NM**: it lists NM's saved VPN connections, activates and deactivates them, and renders NM's reported state. It owns no tunnel, needs no privileges, and has no helper binary or polkit policy.
+- `networkmanagertray/` — `draytek-vpn-tray` ksni StatusNotifier tray, the same front end in tray form. Watches NM over D-Bus (`nmapi`), renders via `tray_impl.rs`. Autostarts on session login via `networkmanagertray/data/draytek-vpn-tray.desktop` installed to `/etc/xdg/autostart/`. Single-instance via the well-known session-bus name `com.draytek.vpn.Tray` (DoNotQueue): second invocation exits cleanly.
+
+### One connection path
+
+There is exactly one way to establish a tunnel: NetworkManager's VPN plugin. The app and the tray both drive it over D-Bus. They do not negotiate, authenticate, create TUN devices, or install routes themselves.
+
+This is load-bearing. When the app ran its own tunnel, it and NM each had a TUN device, credentials, and a DNS takeover, and they disagreed: the app reported "disconnected" while a tunnel was up under NM, and it offered to "clean up" a device NM was using. One path means one status, and the three front ends cannot drift apart.
 
 ## Build & Test
 
@@ -18,7 +25,7 @@ Cargo workspace with four members:
 ```bash
 ./build.sh app                  # standalone GTK4 app (debug)
 ./build.sh app release          # release build
-./build.sh app install          # release + install polkit policy
+./build.sh app install          # release + install the app and desktop entry
 ./build.sh nm release           # NM plugin + editor .so + auth-dialog
 ./build.sh nm install           # build + install + restart NetworkManager
 ./build.sh tray install         # tray indicator + autostart
@@ -77,19 +84,22 @@ Both the library (`protocol/`) and the binaries use `anyhow::Result` end-to-end.
 - **NM plugin runs as root under NetworkManager**; stdin is closed and stderr goes to journald. Don't expect `println!` — use `tracing::{info,warn,error}!`.
 - **`tokio::select!` macro hygiene** brings `std::pin::Pin` into scope inside its branches. Prefer a fully-qualified `std::pin::Pin::new(...)` at the call site so the behaviour doesn't depend on macro internals.
 - **The VPN plugin is a D-Bus activated service and survives `systemctl restart NetworkManager`.** It holds the well-known name, so NM reconnects to the *old* process and the freshly installed `nm-draytek-service` is never loaded — a reinstall silently tests the previous build. `build.sh nm install` now `pkill`s leftovers first. After a manual install, verify with `ps -o pid,lstart,cmd -p "$(pgrep -f nm-draytek-service)"`: the start time must be *after* the install. Note the data-path binary is `/usr/lib/NetworkManager/nm-draytek-service` (7 MB), **not** `libnm-vpn-plugin-draytek.so` in `$NM_PLUGIN_DIR` (18 KB, the libnm capability shim) — checking the `.so` timestamp tells you nothing about whether the running code is current.
-- **The two VPN clients must not share a TUN device name.** The NM plugin uses `draytek0`; the standalone app uses `draytekapp0`. A TUN is a single shared character device, so two clients on one name do not get two tunnels — they get one device whose packets each steals from the other. Worse, both clients delete a leftover device of their own name before connecting, so a shared name means one client tearing down the other's live tunnel. `standalone/src/tunnel/privilege.rs` has a test asserting the names differ. A tunnel belonging to the *other* client is not stale state and must never be cleaned up.
+- **The two front ends are not allowed to become tunnel implementations.** If a change to `standalone/` needs a TUN device, a route, a DNS change or a credential store, it belongs in `networkmanager/` instead. The test is whether the app would still be correct when NM already has a DrayTek VPN up: if it would not, the app is doing something it should not.
 - **The one-line log that tells you which build is live:** HEAD logs `VPN endpoint ... is reached via ...` on every connect. If it is absent from the journal, the running process predates the endpoint-pin work.
 
 ## Key Source Files
 
-- `protocol/src/engine_common.rs` — `PppFsmPair`, `TunnelAddrs`, `PingKeeper`, `TrafficStats`, shared helpers used by both data loops
+- `protocol/src/engine_common.rs` — `PppFsmPair`, `TunnelAddrs`, `DataLoopOptions`, `DataPlaneWitness`, `PingKeeper`, `TrafficStats`, shared helpers used by the plugin data loop
 - `protocol/src/negotiate.rs` — PPP negotiation state machine driver (returns `NegotiationResult` to feed into the data loop)
 - `protocol/src/protocol/fsm.rs` — generic PPP finite state machine (LCP/IPCP)
 - `protocol/src/keepalive.rs` — `KeepaliveTracker`: 10s idle → REQUEST, 3 missed → disconnect
-- `standalone/src/tunnel/engine.rs` — GUI data loop (`data_loop`), Polkit helper invocation via `privilege`
+- `protocol/src/endpoint.rs` — probe and pin the VPN server's own route so the SSTP connection stays outside a full tunnel
 - `networkmanager/src/tunnel.rs` — NM plugin data loop; emits NM D-Bus signals (`state_changed`, `config`, `ip4_config`)
 - `networkmanager/src/plugin.rs` — `org.freedesktop.NetworkManager.VPN.Plugin` D-Bus interface
-- `networkmanagertray/src/nm_monitor.rs` — NM D-Bus watcher; `VpnState` enum flows to tray via `tokio::sync::watch`
+- `nmapi/src/lib.rs` — NM D-Bus observation and control shared by both front ends; `VpnState` flows over `tokio::sync::watch`
+- `standalone/src/nm_bridge.rs` — bridges `nmapi` to the GTK main loop; polls `/sys/class/net/draytek0/statistics` for counters
+- `standalone/src/messages.rs` — `StatusView`, the flat render model derived from NM state
+- `standalone/src/ui/window.rs` — the window: dropdown of NM connections, connect/disconnect, render loop
 - `networkmanagertray/src/tray_impl.rs` — ksni rendering of `VpnState` (icon, tooltip, menu, keepalive status display)
 - `networkmanager/editor/nm-draytek-editor.c` — C editor plugin, GTK3/GTK4 variants built from the same sources
 

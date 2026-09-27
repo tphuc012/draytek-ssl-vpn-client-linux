@@ -1,3 +1,11 @@
+//! NetworkManager observation for DrayTek VPN connections.
+//!
+//! Shared by the tray indicator and the standalone client, because both answer
+//! the same question — "is a DrayTek VPN up, and through what?" — and the answer
+//! lives in NetworkManager, not in either of them. Both clients are front ends
+//! for the same NM VPN plugin; neither owns a tunnel of its own, so there is one
+//! source of truth to read and one connection path to drive.
+
 use anyhow::{Context, Result};
 use futures_util::{FutureExt, StreamExt};
 use std::collections::{HashMap, HashSet};
@@ -5,12 +13,23 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
 use zbus::proxy::CacheProperties;
-use zbus::zvariant::OwnedObjectPath;
+use zbus::zvariant::{OwnedObjectPath, OwnedValue};
 use zbus::Connection;
 
-const SERVICE_TYPE: &str = "org.freedesktop.NetworkManager.draytek";
+pub mod profile;
+pub use profile::{add_profile, delete_profile, load_profile, update_profile, DraytekProfile};
 
-// ── VPN state shared with the tray ──────────────────────────────────
+/// The VPN service type the NM plugin registers.
+pub const SERVICE_TYPE: &str = "org.freedesktop.NetworkManager.draytek";
+
+/// `NM_SETTINGS_ADD_*`: persist the new connection to disk.
+///
+/// `AddConnection2` refuses flags of 0 — a connection that exists only in memory
+/// would vanish when the daemon restarted, and a profile the user just filled in
+/// has to outlive that.
+pub const ADD_TO_DISK: u32 = 0x1;
+
+// ── VPN state shared with the front ends ────────────────────────────
 
 #[derive(Debug, Clone, Default)]
 pub enum VpnState {
@@ -21,13 +40,67 @@ pub enum VpnState {
     },
     Connected {
         name: String,
+        /// Address assigned to the tunnel interface.
         ip: String,
-        gateway: String,
+        /// The VPN *server*, read from `vpn.data.gateway`. Not the in-tunnel
+        /// peer — NM does not expose the latter, and conflating the two makes
+        /// the display claim a gateway address the tunnel never had.
+        server: String,
         routes: Vec<String>,
         path: OwnedObjectPath,
         connected_at: u64,
         keepalive: bool,
     },
+    /// The connection failed, with the reason the plugin reported.
+    ///
+    /// Kept distinct from [`VpnState::Disconnected`] so a front end can say
+    /// *why* rather than flashing "Disconnected" and looking like nothing
+    /// happened.
+    Failed {
+        name: String,
+        reason: String,
+    },
+}
+
+impl VpnState {
+    /// Whether NM's config gave the tunnel the default route.
+    ///
+    /// NM expresses this as a `0.0.0.0/0` entry in the connection's route data,
+    /// so it is read off the routes rather than from a separate flag.
+    pub fn has_default_route(&self) -> bool {
+        match self {
+            VpnState::Connected { routes, .. } => {
+                routes.iter().any(|r| r == "0.0.0.0/0" || r == "0.0.0.0")
+            }
+            _ => false,
+        }
+    }
+
+    /// Routes to show for a full tunnel: the default route is the headline, and
+    /// listing it alongside the split routes it replaces reads as a mistake.
+    pub fn display_routes(&self) -> Vec<String> {
+        match self {
+            VpnState::Connected { routes, .. } => routes
+                .iter()
+                .filter(|r| *r != "0.0.0.0/0" && *r != "0.0.0.0")
+                .cloned()
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+}
+
+/// NM VPN failure reasons, as reported in the `Failure` signal.
+///
+/// Only the two the DrayTek plugin actually emits are named; anything else
+/// falls back to the raw number so an unexpected code is still visible instead
+/// of being flattened into a generic message.
+fn failure_reason(reason: u32) -> String {
+    match reason {
+        0 => "Login failed — check the username and password".to_string(),
+        1 => "Could not reach the VPN server".to_string(),
+        other => format!("Connection failed (reason {other})"),
+    }
 }
 
 // ── NM D-Bus proxy traits ───────────────────────────────────────────
@@ -106,6 +179,20 @@ trait SettingsConnection {
     fn get_settings(
         &self,
     ) -> zbus::Result<HashMap<String, HashMap<String, zbus::zvariant::OwnedValue>>>;
+
+    /// Replace this connection's settings.
+    ///
+    /// One argument, no return value — read off NM 1.54's own introspection
+    /// rather than assumed. The three-argument `Update2` (settings, flags, args)
+    /// does not exist there and fails with `UnknownMethod`.
+    ///
+    /// This is a method of the per-connection object, not of `Settings`: calling
+    /// it on the `Settings` interface fails the same way, which is the only clue
+    /// that the two interfaces are easy to confuse.
+    fn update(&self, connection: HashMap<String, HashMap<String, OwnedValue>>) -> zbus::Result<()>;
+
+    /// Delete this connection.
+    fn delete(&self) -> zbus::Result<()>;
 }
 
 /// org.freedesktop.NetworkManager.Settings
@@ -116,6 +203,22 @@ trait SettingsConnection {
 )]
 trait Settings {
     fn list_connections(&self) -> zbus::Result<Vec<OwnedObjectPath>>;
+
+    /// Add a new connection from a full settings dictionary.
+    ///
+    /// `AddConnection2` rather than the older `AddConnection`: the newer call
+    /// takes flags that let a caller defer persisting, and it is what NM's own
+    /// front ends use. `flags` is a bitfield of `NM_SETTINGS_ADD_*`; zero means
+    /// "add to disk and to memory", which is what an interactive front end wants.
+    /// Returns the new connection's path plus NM's result arguments. The second
+    /// half of the tuple is part of the reply signature, so declaring the return
+    /// as a bare path makes every call fail with a signature mismatch.
+    fn add_connection2(
+        &self,
+        connection: HashMap<String, HashMap<String, OwnedValue>>,
+        flags: u32,
+        args: HashMap<String, OwnedValue>,
+    ) -> zbus::Result<(OwnedObjectPath, HashMap<String, OwnedValue>)>;
 }
 
 // NM VPN connection states
@@ -327,7 +430,7 @@ async fn watch_vpn_connection(
         4 => vpn_conn_state::DISCONNECTED,
         _ => vpn_conn_state::UNKNOWN,
     };
-    handle_vpn_state(conn, state_tx, initial_vpn_state, path, name, &ac).await;
+    handle_vpn_state(conn, state_tx, initial_vpn_state, 0, path, name, &ac).await;
 
     // Subscribe to VpnStateChanged signal
     let mut signal_stream = vpn_conn.receive_vpn_state_changed().await?;
@@ -344,7 +447,7 @@ async fn watch_vpn_connection(
         let reason = *args.reason();
         debug!("VpnStateChanged: state={state} reason={reason}");
 
-        handle_vpn_state(conn, state_tx, state, path, name, &ac).await;
+        handle_vpn_state(conn, state_tx, state, reason, path, name, &ac).await;
 
         // If disconnected or failed, stop watching
         if state == vpn_conn_state::DISCONNECTED || state == vpn_conn_state::FAILED {
@@ -359,6 +462,7 @@ async fn handle_vpn_state(
     conn: &Connection,
     state_tx: &watch::Sender<VpnState>,
     state: u32,
+    reason: u32,
     path: &OwnedObjectPath,
     name: &str,
     ac: &ActiveConnectionProxy<'_>,
@@ -372,24 +476,26 @@ async fn handle_vpn_state(
         },
         vpn_conn_state::ACTIVATED => {
             let ip = read_ip(conn, ac).await.unwrap_or_default();
-            let gateway = read_vpn_gateway(conn, ac).await.unwrap_or_default();
+            let server = read_vpn_server(conn, ac).await.unwrap_or_default();
             let routes = read_routes(conn, ac).await.unwrap_or_default();
             let connected_at = read_connection_timestamp(conn, ac).await.unwrap_or(0);
             let keepalive = read_vpn_keepalive(conn, ac).await.unwrap_or(false);
-            info!("VPN connected: {name} ip={ip} gateway={gateway} routes={routes:?} timestamp={connected_at} keepalive={keepalive}");
+            info!("VPN connected: {name} ip={ip} server={server} routes={routes:?} timestamp={connected_at} keepalive={keepalive}");
             VpnState::Connected {
                 name: name.to_string(),
                 ip,
-                gateway,
+                server,
                 routes,
                 path: path.clone(),
                 connected_at,
                 keepalive,
             }
         }
-        vpn_conn_state::FAILED | vpn_conn_state::DISCONNECTED | vpn_conn_state::UNKNOWN => {
-            VpnState::Disconnected
-        }
+        vpn_conn_state::FAILED => VpnState::Failed {
+            name: name.to_string(),
+            reason: failure_reason(reason),
+        },
+        vpn_conn_state::DISCONNECTED | vpn_conn_state::UNKNOWN => VpnState::Disconnected,
         _ => return,
     };
 
@@ -451,8 +557,8 @@ async fn read_routes(conn: &Connection, ac: &ActiveConnectionProxy<'_>) -> Optio
     }
 }
 
-/// Read the VPN gateway (server address) from the connection's vpn.data settings.
-async fn read_vpn_gateway(conn: &Connection, ac: &ActiveConnectionProxy<'_>) -> Option<String> {
+/// Read the VPN server address from the connection's `vpn.data` settings.
+async fn read_vpn_server(conn: &Connection, ac: &ActiveConnectionProxy<'_>) -> Option<String> {
     let settings_path = ac.connection().await.ok()?;
     let sc = SettingsConnectionProxy::builder(conn)
         .path(settings_path.as_ref())
@@ -622,4 +728,50 @@ pub async fn connect_vpn(conn: &Connection, settings_path: &OwnedObjectPath) -> 
 
     info!("activating VPN connection at {}", settings_path);
     Ok(())
+}
+
+/// A random RFC 4122 version 4 UUID, for connections NM has not seen before.
+///
+/// NM rejects an `AddConnection2` whose `connection.uuid` is not a valid UUID,
+/// and it will not invent one. Sixteen bytes from the kernel CSPRNG is the whole
+/// requirement, so this avoids taking a dependency for a single formatted
+/// random string.
+pub fn uuid_v4() -> String {
+    let mut bytes = [0u8; 16];
+    // /dev/urandom is always available on Linux and never blocks; getrandom(2)
+    // would need a crate or an extern declaration for no benefit here.
+    if std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| {
+            use std::io::Read;
+            f.read_exact(&mut bytes)
+        })
+        .is_err()
+    {
+        // Without randomness there is no safe fallback: a predictable UUID
+        // invites a second connection colliding with this one.
+        panic!("cannot read /dev/urandom to generate a connection UUID");
+    }
+    bytes[6] = (bytes[6] & 0x0f) | 0x40; // version 4
+    bytes[8] = (bytes[8] & 0x3f) | 0x80; // RFC 4122 variant
+
+    let hex: Vec<String> = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    format!(
+        "{}{}{}{}-{}{}-{}{}-{}{}-{}{}{}{}{}{}",
+        hex[0],
+        hex[1],
+        hex[2],
+        hex[3],
+        hex[4],
+        hex[5],
+        hex[6],
+        hex[7],
+        hex[8],
+        hex[9],
+        hex[10],
+        hex[11],
+        hex[12],
+        hex[13],
+        hex[14],
+        hex[15]
+    )
 }

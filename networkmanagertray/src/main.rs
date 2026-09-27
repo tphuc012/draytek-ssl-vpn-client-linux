@@ -1,6 +1,5 @@
 mod format;
 mod icons;
-mod nm_monitor;
 mod stats;
 mod tray_impl;
 
@@ -14,6 +13,7 @@ use zbus::fdo::{RequestNameFlags, RequestNameReply};
 use zbus::zvariant::OwnedObjectPath;
 use zbus::Connection;
 
+use draytek_vpn_nmapi as nm_monitor;
 use nm_monitor::VpnState;
 use tray_impl::VpnTray;
 

@@ -1,9 +1,8 @@
 mod app;
-mod config;
 mod glib_channels;
 mod logging;
 mod messages;
-mod tunnel;
+mod nm_bridge;
 mod ui;
 
 fn main() {

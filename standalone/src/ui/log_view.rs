@@ -2,6 +2,7 @@
 use crate::logging::LogBuffer;
 use gtk4::prelude::*;
 
+#[derive(Clone)]
 pub struct LogView {
     pub container: gtk4::Box,
     text_view: gtk4::TextView,

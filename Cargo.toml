@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["standalone", "protocol", "networkmanager", "networkmanagertray"]
+members = ["standalone", "protocol", "networkmanager", "networkmanagertray", "nmapi"]
 
 [profile.release]
 opt-level = 3

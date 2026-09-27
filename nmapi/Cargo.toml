@@ -1,0 +1,15 @@
+[package]
+name = "draytek-vpn-nmapi"
+version = "0.1.0"
+edition = "2021"
+description = "NetworkManager D-Bus observation for DrayTek VPN connections"
+
+[dependencies]
+zbus = { version = "5", features = ["tokio"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+tracing = "0.1"
+futures-util = "0.3"
+anyhow = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

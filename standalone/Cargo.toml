@@ -9,47 +9,21 @@ default-run = "draytek-vpn"
 name = "draytek-vpn"
 path = "src/main.rs"
 
-[[bin]]
-name = "draytek-vpn-helper"
-path = "src/bin/draytek-vpn-helper.rs"
-
 [dependencies]
-# Shared protocol library
-draytek-vpn-protocol = { path = "../protocol" }
+# Shared NetworkManager observation — the app drives NM, it does not tunnel
+draytek-vpn-nmapi = { path = "../nmapi" }
 # UI
 gtk4 = "0.9"
 libadwaita = { version = "0.7", features = ["v1_5"] }
 
 # Async
 tokio = { version = "1", features = ["full"] }
+zbus = { version = "5", features = ["tokio"] }
 
-# TLS
-openssl = "0.10"
-tokio-openssl = "0.6"
-
-# TUN device
-tun-rs = { version = "2", features = ["async_tokio"] }
-
-# Crypto (MS-CHAPv2 needs MD4, SHA1, DES)
-md4 = "0.10"
-sha1 = "0.10"
-des = "0.8"
-cipher = "0.4"
-
-# Serialization, logging, utilities
-serde = { version = "1", features = ["derive"] }
-toml = "0.8"
+# Logging, utilities
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "local-time"] }
-base64 = "0.22"
-rand = "0.9"
-dirs = "5"
-keyring = { version = "3", features = ["sync-secret-service"] }
-regex = "1"
 anyhow = "1"
-bytes = "1"
-digest = "0.10"
-libc = "0.2"
 time = { version = "0.3.47", features = ["formatting", "local-offset", "macros"] }
 
 [package.metadata.deb]
@@ -57,10 +31,8 @@ name = "draytek-vpn-standalone"
 maintainer = "Julian"
 section = "net"
 priority = "optional"
-depends = "libgtk-4-1, libadwaita-1-0, libssl3, polkit"
+depends = "libgtk-4-1, libadwaita-1-0"
 assets = [
     ["target/release/draytek-vpn", "usr/bin/", "755"],
-    ["target/release/draytek-vpn-helper", "usr/lib/draytek-vpn/", "755"],
-    ["data/com.draytek.vpn.policy", "usr/share/polkit-1/actions/", "644"],
     ["data/draytek-vpn.desktop", "usr/share/applications/", "644"],
 ]

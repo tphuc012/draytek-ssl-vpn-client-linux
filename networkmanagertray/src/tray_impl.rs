@@ -7,8 +7,8 @@ use tokio::sync::mpsc;
 use zbus::zvariant::OwnedObjectPath;
 
 use crate::format::{format_bytes, format_duration, format_packets};
-use crate::nm_monitor::{SavedVpn, VpnState};
 use crate::stats::NetStats;
+use draytek_vpn_nmapi::{SavedVpn, VpnState};
 
 pub struct VpnTray {
     pub vpn_state: VpnState,
@@ -41,7 +41,7 @@ impl ksni::Tray for VpnTray {
 
     fn icon_pixmap(&self) -> Vec<ksni::Icon> {
         let icon = match &self.vpn_state {
-            VpnState::Disconnected => &*crate::icons::DISCONNECTED,
+            VpnState::Disconnected | VpnState::Failed { .. } => &*crate::icons::DISCONNECTED,
             VpnState::Connecting { .. } => &*crate::icons::CONNECTING,
             VpnState::Connected { .. } => &*crate::icons::CONNECTED,
         };
@@ -57,18 +57,19 @@ impl ksni::Tray for VpnTray {
         let title = "DrayTek VPN".to_string();
         let description = match &self.vpn_state {
             VpnState::Disconnected => "Disconnected".to_string(),
+            VpnState::Failed { name, reason } => format!("{name}: {reason}"),
             VpnState::Connecting { name } => format!("Connecting: {name}"),
             VpnState::Connected {
                 name,
                 ip,
-                gateway,
+                server,
                 routes,
                 keepalive,
                 ..
             } => {
                 let mut lines = vec![
                     format!("Connected: {name}"),
-                    format!("Server: {gateway}"),
+                    format!("Server: {server}"),
                     format!("IP: {ip}"),
                 ];
                 if let Some(at) = self.connected_at {
@@ -110,7 +111,9 @@ impl ksni::Tray for VpnTray {
 
     fn menu(&self) -> Vec<MenuItem<Self>> {
         let mut items = match &self.vpn_state {
-            VpnState::Disconnected => {
+            // A failed connection still has saved profiles worth offering, so it
+            // shares the disconnected menu rather than showing an empty one.
+            VpnState::Disconnected | VpnState::Failed { .. } => {
                 let mut items: Vec<MenuItem<Self>> = Vec::new();
                 items.push(label("Disconnected"));
                 items.push(MenuItem::Separator);
@@ -192,7 +195,7 @@ impl ksni::Tray for VpnTray {
             VpnState::Connected {
                 name,
                 ip,
-                gateway,
+                server,
                 routes,
                 path,
                 keepalive,
@@ -201,7 +204,7 @@ impl ksni::Tray for VpnTray {
                 let mut items: Vec<MenuItem<Self>> = Vec::new();
 
                 items.push(label(&format!("Connected: {name}")));
-                items.push(label(&format!("Server: {gateway}")));
+                items.push(label(&format!("Server: {server}")));
                 items.push(label(&format!("IP: {ip}")));
 
                 if let Some(at) = self.connected_at {

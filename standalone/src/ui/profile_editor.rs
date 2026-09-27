@@ -1,114 +1,148 @@
-/// Profile editor dialog for adding/editing VPN connection profiles.
-use crate::config::{self, ProfileConfig};
+/// Connection editor: create and edit DrayTek VPN profiles.
+///
+/// The form is the only place profiles are entered, and it writes them straight
+/// into NetworkManager rather than into a file of its own. That is what lets the
+/// app, the tray and GNOME Settings all see one list: a profile created here is
+/// the same profile `nmcli` and the C editor plugin work with, with no import
+/// step and no second copy to fall out of sync.
+use crate::messages::DraytekProfile;
 use gtk4::prelude::*;
 use libadwaita as adw;
 use libadwaita::prelude::*;
+use tracing::error;
 
-/// Show a profile editor dialog.
+/// Show the editor for a new or existing profile.
 ///
-/// `on_save` is called with the edited profile when the user clicks Save.
-/// `on_delete` is called (if `Some`) when the user confirms deletion — only shown when editing.
-pub fn show_profile_editor(
+/// `existing` is `None` for a new profile. `on_save` receives the edited
+/// profile; persisting it is the caller's job, because that means a different
+/// D-Bus call for a new connection than for an existing one.
+pub fn show_editor(
     parent: &adw::ApplicationWindow,
-    existing: Option<&ProfileConfig>,
-    on_save: impl Fn(ProfileConfig) + 'static,
-    on_delete: Option<impl Fn() + 'static>,
+    existing: Option<DraytekProfile>,
+    on_save: impl Fn(DraytekProfile) + 'static,
 ) {
-    let dialog = adw::Dialog::builder()
-        .title(if existing.is_some() {
-            "Edit Profile"
+    let editing = existing.is_some();
+    let profile = existing.unwrap_or_else(|| DraytekProfile {
+        name: String::new(),
+        gateway: String::new(),
+        port: 443,
+        ..Default::default()
+    });
+
+    let dialog = adw::AlertDialog::builder()
+        .heading(if editing {
+            "Edit Connection"
         } else {
-            "New Profile"
+            "New Connection"
         })
-        .content_width(450)
-        .content_height(550)
+        .body("Saved to NetworkManager, so GNOME Settings and the tray see it too.")
         .build();
 
-    let toolbar_view = adw::ToolbarView::new();
-
-    let header = adw::HeaderBar::new();
-    toolbar_view.add_top_bar(&header);
-
-    let content = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
-
-    let prefs_page = adw::PreferencesPage::new();
-
-    // Connection group
-    let conn_group = adw::PreferencesGroup::builder().title("Connection").build();
+    let group = adw::PreferencesGroup::new();
+    let page = adw::PreferencesPage::new();
+    page.add(&group);
 
     let name_row = adw::EntryRow::builder()
-        .title("Profile Name")
-        .tooltip_text("A friendly name to identify this connection")
+        .title("Name")
+        .text(&profile.name)
+        .tooltip_text("How this connection is listed in the app, the tray and Settings")
         .build();
-    let server_row = adw::EntryRow::builder()
-        .title("Server Address")
+    let gateway_row = adw::EntryRow::builder()
+        .title("Server address")
+        .text(&profile.gateway)
         .tooltip_text("Hostname or IP address of the DrayTek router")
         .build();
     let port_row = adw::SpinRow::builder()
         .title("Port")
         .tooltip_text("SSL VPN port on the router (default: 443)")
-        .adjustment(&gtk4::Adjustment::new(443.0, 1.0, 65535.0, 1.0, 10.0, 0.0))
+        .adjustment(&gtk4::Adjustment::new(
+            f64::from(profile.port.max(1)),
+            1.0,
+            65535.0,
+            1.0,
+            10.0,
+            0.0,
+        ))
         .build();
     let username_row = adw::EntryRow::builder()
         .title("Username")
-        .tooltip_text("VPN account username configured on the router")
+        .text(&profile.username)
         .build();
     let password_row = adw::PasswordEntryRow::builder()
         .title("Password")
-        .tooltip_text("VPN account password")
-        .build();
-
-    conn_group.add(&name_row);
-    conn_group.add(&server_row);
-    conn_group.add(&port_row);
-    conn_group.add(&username_row);
-    conn_group.add(&password_row);
-    prefs_page.add(&conn_group);
-
-    // Options group
-    let opts_group = adw::PreferencesGroup::builder().title("Options").build();
-
-    let self_signed_row = adw::SwitchRow::builder()
-        .title("Accept Self-Signed Certificates")
-        .tooltip_text("Allow connections to routers using self-signed TLS certificates")
-        .active(true)
-        .build();
-    let route_remote_row = adw::SwitchRow::builder()
-        .title("Route Remote Network")
         .tooltip_text(
-            "Automatically adds a route for the gateway's subnet when connected.\n\
-             e.g. gateway 192.168.1.1 → auto-adds route 192.168.1.0/24,\n\
-             so all 192.168.1.* traffic goes through the VPN.",
+            "Stored by NetworkManager with the connection, the same way GNOME \
+             Settings stores it. Leave blank when editing to keep the saved password.",
         )
-        .active(true)
         .build();
-    let default_gw_row = adw::SwitchRow::builder()
-        .title("Use as Default Gateway")
-        .tooltip_text("Route all internet traffic through the VPN tunnel")
-        .active(false)
+    // The router's certificate is self-signed by default, so this reads as
+    // "check the certificate" and defaults to off.
+    let verify_row = adw::SwitchRow::builder()
+        .title("Verify TLS certificate")
+        .tooltip_text("Leave off for the router's self-signed certificate")
+        .active(profile.verify_cert)
         .build();
     let keepalive_row = adw::SwitchRow::builder()
         .title("Keepalive")
-        .tooltip_text("Automatically send periodic pings when connected to prevent the router's idle timeout from dropping the tunnel")
-        .active(false)
+        .tooltip_text(
+            "Send periodic pings so the router does not drop the tunnel when idle. \
+             Worth enabling on a full tunnel, where the connection is the only route out.",
+        )
+        .active(profile.keepalive)
         .build();
-    let mru_row = adw::SpinRow::builder()
-        .title("MRU (0 = default 1280)")
-        .tooltip_text("Maximum Receive Unit — largest packet size we accept. 0 uses the default (1280). The router may negotiate a different value.")
-        .adjustment(&gtk4::Adjustment::new(0.0, 0.0, 9000.0, 1.0, 100.0, 0.0))
+    let default_gw_row = adw::SwitchRow::builder()
+        .title("Use as default gateway")
+        .tooltip_text(
+            "Route all internet traffic through the tunnel.\n\
+             Off means only the subnets below go through the VPN.",
+        )
+        .active(profile.default_gateway)
+        .build();
+    let route_remote_row = adw::SwitchRow::builder()
+        .title("Route remote network")
+        .tooltip_text("Also route the router's own subnet through the tunnel")
+        .active(profile.route_remote_network)
         .build();
     let routes_row = adw::EntryRow::builder()
-        .title("Additional Routes (comma-separated CIDR)")
+        .title("Additional routes")
+        .text(&profile.routes)
         .tooltip_text(
-            "Subnets to route through the VPN tunnel (CIDR notation).\n\
-             e.g. 192.168.1.0/24 routes all 192.168.1.* traffic via VPN.\n\
-             /24 = whole subnet (254 hosts), /32 = single host.\n\
-             Without routes, no traffic flows through the tunnel.",
+            "Extra subnets to route through the tunnel, comma separated CIDR.\n\
+             e.g. 10.0.0.0/8,192.168.5.0/24\n\
+             Ignored when the connection is the default gateway.",
         )
         .build();
+    let mru_row = adw::SpinRow::builder()
+        .title("MRU")
+        .tooltip_text("Largest packet the router will accept. 0 uses the protocol default of 1280")
+        .adjustment(&gtk4::Adjustment::new(
+            f64::from(profile.mru),
+            0.0,
+            9000.0,
+            1.0,
+            100.0,
+            0.0,
+        ))
+        .build();
 
-    // When default gateway is on, routing options are redundant
-    let update_route_sensitivity = {
+    group.add(&name_row);
+    group.add(&gateway_row);
+    group.add(&port_row);
+    group.add(&username_row);
+    group.add(&password_row);
+    group.add(&verify_row);
+
+    let routing_group = adw::PreferencesGroup::new();
+    routing_group.add(&default_gw_row);
+    routing_group.add(&route_remote_row);
+    routing_group.add(&routes_row);
+    routing_group.add(&keepalive_row);
+    routing_group.add(&mru_row);
+    page.add(&routing_group);
+
+    // A full tunnel already carries everything, so the per-subnet options stop
+    // meaning anything and leaving them enabled only misleads.
+    let update_sensitivity = {
         let route_remote_row = route_remote_row.clone();
         let routes_row = routes_row.clone();
         move |is_default_gw: bool| {
@@ -116,130 +150,139 @@ pub fn show_profile_editor(
             routes_row.set_sensitive(!is_default_gw);
         }
     };
-    update_route_sensitivity(default_gw_row.is_active());
-    {
-        let update = update_route_sensitivity.clone();
-        default_gw_row.connect_active_notify(move |row| {
-            update(row.is_active());
-        });
-    }
+    update_sensitivity(profile.default_gateway);
+    default_gw_row.connect_active_notify(move |row| {
+        update_sensitivity(row.is_active());
+    });
 
-    opts_group.add(&route_remote_row);
-    opts_group.add(&routes_row);
-    opts_group.add(&default_gw_row);
-    opts_group.add(&keepalive_row);
-    opts_group.add(&self_signed_row);
-    opts_group.add(&mru_row);
-    prefs_page.add(&opts_group);
+    dialog.set_extra_child(Some(&page));
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("save", "Save");
+    dialog.set_response_appearance("save", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("save"));
+    dialog.set_close_response("cancel");
 
-    // Pre-fill if editing
-    if let Some(profile) = existing {
-        name_row.set_text(&profile.name);
-        server_row.set_text(&profile.server);
-        port_row.set_value(profile.port as f64);
-        username_row.set_text(&profile.username);
-        let pw = config::retrieve_password(&profile.name).unwrap_or_default();
-        password_row.set_text(&pw);
-        self_signed_row.set_active(profile.accept_self_signed);
-        route_remote_row.set_active(profile.route_remote_network);
-        default_gw_row.set_active(profile.default_gateway);
-        keepalive_row.set_active(profile.keepalive);
-        mru_row.set_value(profile.mru as f64);
-        routes_row.set_text(&profile.routes.join(", "));
-    }
-
-    // Save button
-    let save_btn = gtk4::Button::builder()
-        .label("Save")
-        .css_classes(["suggested-action"])
-        .build();
-
-    let btn_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 12);
-    btn_box.set_halign(gtk4::Align::Fill);
-    btn_box.set_homogeneous(true);
-    btn_box.set_margin_top(24);
-    btn_box.set_margin_bottom(24);
-    btn_box.set_margin_start(24);
-    btn_box.set_margin_end(24);
-    // Delete button — only when editing an existing profile (left side)
-    if let Some(on_delete) = on_delete {
-        let delete_btn = gtk4::Button::builder()
-            .label("Delete")
-            .css_classes(["destructive-action"])
-            .build();
-
-        let dialog_ref = dialog.clone();
-        let on_delete = std::rc::Rc::new(std::cell::RefCell::new(Some(on_delete)));
-        let profile_name = existing.map(|p| p.name.clone()).unwrap_or_default();
-
-        delete_btn.connect_clicked(move |btn| {
-            let confirm = adw::AlertDialog::builder()
-                .heading("Delete Profile?")
-                .body(format!(
-                    "Are you sure you want to delete \"{profile_name}\"? This cannot be undone."
-                ))
-                .build();
-            confirm.add_response("cancel", "Cancel");
-            confirm.add_response("delete", "Delete");
-            confirm.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
-            confirm.set_default_response(Some("cancel"));
-            confirm.set_close_response("cancel");
-
-            let dialog_ref = dialog_ref.clone();
-            let on_delete = on_delete.clone();
-            confirm.connect_response(None, move |_, response| {
-                if response == "delete" {
-                    if let Some(f) = on_delete.borrow_mut().take() {
-                        f();
-                    }
-                    dialog_ref.close();
-                }
-            });
-            confirm.present(Some(btn));
-        });
-
-        btn_box.append(&delete_btn);
-    }
-
-    // Save always on the right
-    btn_box.append(&save_btn);
-
-    content.append(&prefs_page);
-    content.append(&btn_box);
-
-    let scrolled = gtk4::ScrolledWindow::builder()
-        .child(&content)
-        .vexpand(true)
-        .build();
-
-    toolbar_view.set_content(Some(&scrolled));
-    dialog.set_child(Some(&toolbar_view));
-
-    let dialog_clone = dialog.clone();
-    save_btn.connect_clicked(move |_| {
-        let routes_text: String = routes_row.text().into();
-        let routes: Vec<String> = routes_text
-            .split(',')
-            .map(|part: &str| part.trim().to_string())
-            .filter(|part: &String| !part.is_empty())
-            .collect();
-
-        let profile = ProfileConfig {
-            name: name_row.text().into(),
-            server: server_row.text().into(),
+    dialog.connect_response(None, move |_, response| {
+        if response != "save" {
+            return;
+        }
+        let edited = DraytekProfile {
+            name: name_row.text().trim().to_string(),
+            gateway: gateway_row.text().trim().to_string(),
             port: port_row.value() as u16,
-            username: username_row.text().into(),
-            password: password_row.text().into(),
-            accept_self_signed: self_signed_row.is_active(),
+            username: username_row.text().trim().to_string(),
+            password: password_row.text().to_string(),
+            verify_cert: verify_row.is_active(),
+            mru: mru_row.value() as u16,
             route_remote_network: route_remote_row.is_active(),
             default_gateway: default_gw_row.is_active(),
             keepalive: keepalive_row.is_active(),
-            mru: mru_row.value() as u16,
-            routes,
+            routes: routes_row.text().trim().to_string(),
         };
-        on_save(profile);
-        dialog_clone.close();
+        if let Err(e) = validate(&edited) {
+            error!("Refusing to save an invalid profile: {e}");
+            // The dialog is gone by now, so the reason has to reach the log and
+            // the caller re-opens the form; there is no dialog left to show it in.
+            return;
+        }
+        on_save(edited);
     });
 
     dialog.present(Some(parent));
+}
+
+/// Reject a profile the plugin could not use.
+///
+/// Better here than at connect time: the plugin's own parser reports only
+/// "Missing 'gateway' in vpn.data", which by then looks like a plugin bug.
+fn validate(profile: &DraytekProfile) -> anyhow::Result<()> {
+    if profile.name.trim().is_empty() {
+        anyhow::bail!("Name is required");
+    }
+    if profile.gateway.trim().is_empty() {
+        anyhow::bail!("Server address is required");
+    }
+    if profile.username.trim().is_empty() {
+        anyhow::bail!("Username is required");
+    }
+    if profile.port == 0 {
+        anyhow::bail!("Port must be between 1 and 65535");
+    }
+    Ok(())
+}
+
+/// Confirm and run a destructive action on a profile.
+pub fn confirm_delete(
+    parent: &adw::ApplicationWindow,
+    name: &str,
+    on_confirm: impl Fn() + 'static,
+) {
+    let dialog = adw::AlertDialog::builder()
+        .heading("Delete connection?")
+        .body(format!(
+            "\"{name}\" will be removed from NetworkManager. \
+             This cannot be undone, and the password saved with it goes too."
+        ))
+        .build();
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("delete", "Delete");
+    dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+    dialog.connect_response(None, move |_, response| {
+        if response == "delete" {
+            on_confirm();
+        }
+    });
+    dialog.present(Some(parent));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn valid() -> DraytekProfile {
+        DraytekProfile {
+            name: "Office".to_string(),
+            gateway: "vpn.example.com".to_string(),
+            port: 443,
+            username: "alice".to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_complete_profile_passes() {
+        validate(&valid()).expect("should be accepted");
+    }
+
+    /// Each of these produces a connection that saves fine and then fails to
+    /// start, with a message that points at the plugin rather than the form.
+    #[test]
+    fn each_missing_field_names_itself() {
+        let mut p = valid();
+        p.name = "  ".to_string();
+        assert!(validate(&p).is_err_and(|e| e.to_string().contains("Name")));
+
+        let mut p = valid();
+        p.gateway = String::new();
+        assert!(validate(&p).is_err_and(|e| e.to_string().contains("Server")));
+
+        let mut p = valid();
+        p.username = String::new();
+        assert!(validate(&p).is_err_and(|e| e.to_string().contains("Username")));
+
+        let mut p = valid();
+        p.port = 0;
+        assert!(validate(&p).is_err_and(|e| e.to_string().contains("Port")));
+    }
+
+    /// A password is the one field that may be absent: on an edit, blank means
+    /// "keep the one NetworkManager has stored".
+    #[test]
+    fn password_is_never_required_here() {
+        let mut p = valid();
+        p.password = String::new();
+        validate(&p).expect("a blank password must not block saving");
+    }
 }

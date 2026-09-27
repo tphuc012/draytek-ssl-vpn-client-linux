@@ -1,19 +1,32 @@
 /// Main application window.
-use crate::config::{self, AppConfig};
+///
+/// The window is a front end for NetworkManager's DrayTek VPN plugin. It holds
+/// no tunnel: Connect and Disconnect are NM calls, and everything drawn comes
+/// from NM's own reported state.
+///
+/// That is the point. The tray, GNOME Settings and this window all read the
+/// same connection, so they cannot disagree about whether the VPN is up — which
+/// is exactly what happened when the app ran a second, independent tunnel of
+/// its own and reported "disconnected" while NM was connected.
 use crate::glib_channels::GlibSender;
 use crate::logging::LogBuffer;
-use crate::messages::{ConnectionProfile, TunnelCommand, TunnelStatus};
+use crate::messages::{DraytekProfile, SavedVpn, StatusView};
+use crate::nm_bridge::{self, NmSession};
 use crate::ui::connection_view::ConnectionView;
 use crate::ui::log_view::LogView;
 use crate::ui::profile_editor;
+use draytek_vpn_nmapi::VpnState;
 use gtk4::prelude::*;
 use libadwaita as adw;
 use libadwaita::prelude::*;
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
-use tokio::sync::mpsc;
 use tracing::{error, info};
+use zbus::zvariant::OwnedObjectPath;
+
+/// How often the uptime and traffic counters advance, and the log repaints.
+const TICK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
 pub struct MainWindow {
     pub window: adw::ApplicationWindow,
@@ -28,378 +41,381 @@ impl MainWindow {
         let window = adw::ApplicationWindow::builder()
             .application(app)
             .title("DrayTek SSL VPN")
-            .default_width(500)
-            .default_height(700)
-            .width_request(500)
-            .height_request(400)
+            .default_width(520)
+            .default_height(680)
+            .width_request(520)
+            .height_request(420)
             .build();
 
-        // State
-        let mut loaded_config = config::load_config().unwrap_or_else(|e| {
-            error!("Failed to load config: {e:#}");
-            AppConfig::default()
-        });
-        config::migrate_passwords(&mut loaded_config);
-        let app_config = Rc::new(RefCell::new(loaded_config));
-        let tunnel_cmd_tx: Rc<RefCell<Option<mpsc::UnboundedSender<TunnelCommand>>>> =
-            Rc::new(RefCell::new(None));
-        let profile_keepalive: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        // Shared truth, written from the tokio side and read on the GTK thread.
+        // `Arc<Mutex<_>>` rather than `Rc<RefCell<_>>` because the sender side
+        // must be `Send + Sync`; the widget side stays on the GTK thread and
+        // only ever takes the lock briefly.
+        //
+        // Each holds the newest value rather than a queue: NM is the only
+        // writer, so there is no ordering to preserve and a backlog would just
+        // replay states the window has already drawn.
+        let state: Arc<Mutex<VpnState>> = Arc::new(Mutex::new(VpnState::Disconnected));
+        let saved: Arc<Mutex<Vec<SavedVpn>>> = Arc::new(Mutex::new(Vec::new()));
+        // `Arc` rather than a bare `Option<NmSession>`: the click handlers are
+        // `Fn`, so each nested save callback has to be able to take its own
+        // handle to the session without moving one out of a shared capture.
+        let session: Arc<Mutex<Option<Arc<NmSession>>>> = Arc::new(Mutex::new(None));
+        // Only ever touched on the GTK thread, so it needs no locking.
+        let selected: Rc<Cell<usize>> = Rc::new(Cell::new(0));
+        // A profile the async loader has fetched and is waiting for the GTK
+        // thread to render into the editor form.
+        let pending_edit: Arc<Mutex<Option<(DraytekProfile, OwnedObjectPath)>>> =
+            Arc::new(Mutex::new(None));
 
-        // Shared status queue: tunnel thread pushes, UI thread polls
-        let status_queue: Arc<Mutex<Vec<TunnelStatus>>> = Arc::new(Mutex::new(Vec::new()));
-
-        // Layout
         let toolbar_view = adw::ToolbarView::new();
-
         let header = adw::HeaderBar::new();
         toolbar_view.add_top_bar(&header);
 
         let content = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
 
-        // Profile selector
-        let dropdown_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
-        dropdown_box.set_margin_start(16);
-        dropdown_box.set_margin_end(16);
-        dropdown_box.set_margin_top(8);
+        // Connection selector, filled from NM's saved VPN connections.
+        let selector_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+        selector_box.set_margin_start(16);
+        selector_box.set_margin_end(16);
+        selector_box.set_margin_top(8);
 
-        let profile_dropdown = gtk4::DropDown::builder().hexpand(true).build();
+        let dropdown = gtk4::DropDown::builder()
+            .hexpand(true)
+            .tooltip_text("DrayTek VPN connections saved in NetworkManager")
+            .build();
 
         let add_btn = gtk4::Button::builder()
             .icon_name("list-add-symbolic")
-            .tooltip_text("Add Profile")
+            .tooltip_text("Add a connection")
             .css_classes(["flat"])
             .build();
         let edit_btn = gtk4::Button::builder()
             .icon_name("document-edit-symbolic")
-            .tooltip_text("Edit Profile")
+            .tooltip_text("Edit the selected connection")
+            .css_classes(["flat"])
+            .build();
+        let delete_btn = gtk4::Button::builder()
+            .icon_name("user-trash-symbolic")
+            .tooltip_text("Delete the selected connection")
             .css_classes(["flat"])
             .build();
 
-        dropdown_box.append(&profile_dropdown);
-        dropdown_box.append(&add_btn);
-        dropdown_box.append(&edit_btn);
+        selector_box.append(&dropdown);
+        selector_box.append(&add_btn);
+        selector_box.append(&edit_btn);
+        selector_box.append(&delete_btn);
+        content.append(&selector_box);
 
-        content.append(&dropdown_box);
+        let connection_view = ConnectionView::new();
+        let log_view = LogView::new(log_buffer);
 
-        // Connection view
-        let connection_view = Rc::new(ConnectionView::new());
-        content.append(&connection_view.container);
-
-        // Separator
-        let separator = gtk4::Separator::new(gtk4::Orientation::Horizontal);
-        content.append(&separator);
-
-        // Log view
-        let log_view = Rc::new(LogView::new(log_buffer.clone()));
-        content.append(&log_view.container);
-
-        let scrolled = gtk4::ScrolledWindow::builder()
-            .child(&content)
-            .vexpand(true)
+        let scroller = gtk4::ScrolledWindow::builder()
+            .hexpand(true)
+            .vexpand(false)
+            .child(&connection_view.container)
             .build();
+        content.append(&scroller);
 
-        toolbar_view.set_content(Some(&scrolled));
-        window.set_content(Some(&toolbar_view));
+        let log_scroller = gtk4::ScrolledWindow::builder()
+            .hexpand(true)
+            .vexpand(true)
+            .child(&log_view.container)
+            .build();
+        content.append(&log_scroller);
+        toolbar_view.set_content(Some(&content));
 
-        // Populate dropdown
-        let update_dropdown = {
-            let config = app_config.clone();
-            let dropdown = profile_dropdown.clone();
-            move || {
-                let cfg = config.borrow();
-                let names: Vec<String> = cfg.profiles.iter().map(|p| p.name.clone()).collect();
-                let model =
-                    gtk4::StringList::new(&names.iter().map(|s| s.as_str()).collect::<Vec<_>>());
-                dropdown.set_model(Some(&model));
-                if let Some(idx) = cfg.last_selected {
-                    if idx < cfg.profiles.len() {
-                        dropdown.set_selected(idx as u32);
-                    }
-                }
-            }
-        };
-        update_dropdown();
+        // ── NM wiring ────────────────────────────────────────────────────
+        // Callbacks cannot touch widgets (the sender must be `Send + Sync`), so
+        // they publish the newest value and the GTK timer below draws it.
 
-        // Add profile button
         {
-            let window_clone = window.clone();
-            let config = app_config.clone();
-            let update_fn = update_dropdown.clone();
+            let state = state.clone();
+            let on_state = GlibSender::new(move |new_state: VpnState| {
+                *state.lock().expect("state lock poisoned") = new_state;
+            });
+            nm_bridge::watch_nm(&tokio_handle, on_state);
+        }
+
+        {
+            let session = session.clone();
+            let saved = saved.clone();
+            let on_saved = GlibSender::new(move |list: Vec<SavedVpn>| {
+                *saved.lock().expect("saved lock poisoned") = list;
+            });
+
+            let session_out = session.clone();
+            let handle = tokio_handle.clone();
+            let inner = handle.clone();
+            handle.spawn(async move {
+                match NmSession::open().await {
+                    Ok(s) => {
+                        let s = Arc::new(s);
+                        *session_out.lock().expect("session lock poisoned") = Some(s.clone());
+                        nm_bridge::watch_saved(&inner, s, on_saved);
+                    }
+                    Err(e) => error!("Cannot open a NetworkManager session: {e:#}"),
+                }
+            });
+        }
+
+        {
+            let selected = selected.clone();
+            dropdown.connect_selected_notify(move |dd| {
+                selected.set(dd.selected() as usize);
+            });
+        }
+
+        // ── Profile editing ───────────────────────────────────────────────
+        // Every save goes to NetworkManager, so the app never holds a profile
+        // the rest of the system cannot see.
+
+        {
+            let session = session.clone();
+            let parent = window.clone();
+            let handle = tokio_handle.clone();
             add_btn.connect_clicked(move |_| {
-                let config = config.clone();
-                let update_fn = update_fn.clone();
-                profile_editor::show_profile_editor(
-                    &window_clone,
-                    None,
-                    move |profile| {
-                        if let Err(e) = config::store_password(&profile.name, &profile.password) {
-                            error!("Failed to store password in keyring: {e:#}");
-                        }
-                        let mut cfg = config.borrow_mut();
-                        cfg.profiles.push(profile);
-                        cfg.last_selected = Some(cfg.profiles.len() - 1);
-                        if let Err(e) = config::save_config(&cfg) {
-                            error!("Failed to save config: {e:#}");
-                        }
-                        drop(cfg);
-                        update_fn();
-                    },
-                    None::<fn()>,
-                );
-            });
-        }
-
-        // Edit profile button
-        {
-            let window_clone = window.clone();
-            let config = app_config.clone();
-            let dropdown = profile_dropdown.clone();
-            let update_fn = update_dropdown.clone();
-            edit_btn.connect_clicked(move |_| {
-                let idx = dropdown.selected() as usize;
-                let cfg = config.borrow();
-                if idx >= cfg.profiles.len() {
+                let Some(nm) = session.lock().ok().and_then(|s| s.clone()) else {
+                    error!("No NetworkManager session available");
                     return;
-                }
-                let existing = cfg.profiles[idx].clone();
-                let old_name = existing.name.clone();
-                drop(cfg);
-
-                let config = config.clone();
-                let update_fn = update_fn.clone();
-                let delete_config = config.clone();
-                let delete_update_fn = update_fn.clone();
-                let delete_name = old_name.clone();
-                profile_editor::show_profile_editor(
-                    &window_clone,
-                    Some(&existing),
-                    move |profile| {
-                        // Handle rename: delete old keyring entry if name changed
-                        if profile.name != old_name {
-                            config::delete_password(&old_name);
+                };
+                // Cloned per invocation: a click handler is `Fn`, so it may be
+                // called again and cannot hand its captures away.
+                let parent = parent.clone();
+                let handle = handle.clone();
+                profile_editor::show_editor(&parent, None, move |profile| {
+                    let handle = handle.clone();
+                    let nm = nm.clone();
+                    handle.spawn(async move {
+                        match nm.add(&profile).await {
+                            Ok(path) => info!("Saved new connection {} at {path}", profile.name),
+                            Err(e) => error!("Could not save {}: {e:#}", profile.name),
                         }
-                        if let Err(e) = config::store_password(&profile.name, &profile.password) {
-                            error!("Failed to store password in keyring: {e:#}");
-                        }
-                        let mut cfg = config.borrow_mut();
-                        if idx < cfg.profiles.len() {
-                            cfg.profiles[idx] = profile;
-                            if let Err(e) = config::save_config(&cfg) {
-                                error!("Failed to save config: {e:#}");
-                            }
-                        }
-                        drop(cfg);
-                        update_fn();
-                    },
-                    Some(move || {
-                        config::delete_password(&delete_name);
-                        let mut cfg = delete_config.borrow_mut();
-                        if idx < cfg.profiles.len() {
-                            cfg.profiles.remove(idx);
-                            cfg.last_selected = if cfg.profiles.is_empty() {
-                                None
-                            } else {
-                                Some(0)
-                            };
-                            if let Err(e) = config::save_config(&cfg) {
-                                error!("Failed to save config: {e:#}");
-                            }
-                            drop(cfg);
-                            delete_update_fn();
-                        } else {
-                            drop(cfg);
-                            delete_update_fn();
-                        }
-                    }),
-                );
-            });
-        }
-
-        // Connect button
-        {
-            let config = app_config.clone();
-            let dropdown = profile_dropdown.clone();
-            let tunnel_cmd_tx = tunnel_cmd_tx.clone();
-            let tokio_handle = tokio_handle.clone();
-            let status_queue = status_queue.clone();
-            let profile_keepalive = profile_keepalive.clone();
-
-            connection_view.connect_btn.connect_clicked(move |_| {
-                let idx = dropdown.selected() as usize;
-                let cfg = config.borrow();
-                if idx >= cfg.profiles.len() {
-                    error!("No profile selected");
-                    return;
-                }
-                let profile_cfg = cfg.profiles[idx].clone();
-                drop(cfg);
-
-                let profile: ConnectionProfile = profile_cfg.into();
-                profile_keepalive.set(profile.keepalive);
-                info!("Connecting to {}", profile.server);
-
-                // Create command channel
-                let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
-                *tunnel_cmd_tx.borrow_mut() = Some(cmd_tx);
-
-                // Create status sender — pushes to thread-safe queue,
-                // then pokes the GLib main loop to drain it.
-                let queue = status_queue.clone();
-                let status_tx = GlibSender::new(move |status: TunnelStatus| {
-                    queue
-                        .lock()
-                        .expect("status queue lock poisoned")
-                        .push(status);
+                    });
                 });
-
-                // Spawn tunnel task
-                tokio_handle.spawn(crate::tunnel::engine::run(profile, status_tx, cmd_rx));
             });
         }
 
-        // Disconnect button
         {
-            let tunnel_cmd_tx = tunnel_cmd_tx.clone();
+            let session = session.clone();
+            let saved = saved.clone();
+            let selected = selected.clone();
+            let handle = tokio_handle.clone();
+            let pending_edit = pending_edit.clone();
+            edit_btn.connect_clicked(move |_| {
+                let Some(nm) = session.lock().ok().and_then(|s| s.clone()) else {
+                    error!("No NetworkManager session available");
+                    return;
+                };
+                let target = saved
+                    .lock()
+                    .ok()
+                    .and_then(|list| list.get(selected.get()).cloned());
+                let Some(target) = target else {
+                    error!("No connection selected to edit");
+                    return;
+                };
+
+                // Reading the stored profile is D-Bus work and has to happen off
+                // the GTK thread, but showing the form is widget work and cannot
+                // leave it. So the load publishes here and the render timer below
+                // picks it up — a GTK widget is not `Send`, so there is no way to
+                // hand one to the async task.
+                let pending = pending_edit.clone();
+                let name = target.name.clone();
+                handle.spawn(async move {
+                    match nm.load(&target.path).await {
+                        Ok(Some(profile)) => {
+                            *pending.lock().expect("pending-edit lock poisoned") =
+                                Some((profile, target.path));
+                        }
+                        Ok(None) => error!("{name} is not a DrayTek connection"),
+                        Err(e) => error!("Could not read {name}: {e:#}"),
+                    }
+                });
+            });
+        }
+
+        {
+            let session = session.clone();
+            let saved = saved.clone();
+            let selected = selected.clone();
+            let parent = window.clone();
+            let handle = tokio_handle.clone();
+            delete_btn.connect_clicked(move |_| {
+                let Some(nm) = session.lock().ok().and_then(|s| s.clone()) else {
+                    error!("No NetworkManager session available");
+                    return;
+                };
+                let target = saved
+                    .lock()
+                    .ok()
+                    .and_then(|list| list.get(selected.get()).cloned());
+                let Some(target) = target else {
+                    error!("No connection selected to delete");
+                    return;
+                };
+
+                let parent = parent.clone();
+                let name = target.name.clone();
+                let for_delete = handle.clone();
+                let shown = name.clone();
+                profile_editor::confirm_delete(&parent, &shown, move || {
+                    let handle = for_delete.clone();
+                    let nm = nm.clone();
+                    let path = target.path.clone();
+                    let name = name.clone();
+                    handle.spawn(async move {
+                        if let Err(e) = nm.remove(&path).await {
+                            error!("Could not delete {name}: {e:#}");
+                        }
+                    });
+                });
+            });
+        }
+
+        {
+            let session = session.clone();
+            let saved = saved.clone();
+            let selected = selected.clone();
+            let handle = tokio_handle.clone();
+            connection_view.connect_btn.connect_clicked(move |_| {
+                let vpn = {
+                    let list = saved.lock().expect("saved lock poisoned");
+                    list.get(selected.get()).cloned()
+                };
+                let Some(vpn) = vpn else {
+                    error!("No DrayTek VPN connection selected");
+                    return;
+                };
+
+                let session = session.lock().expect("session lock poisoned").clone();
+                let Some(session) = session else {
+                    error!("No NetworkManager session available");
+                    return;
+                };
+                handle.spawn(async move {
+                    if let Err(e) = session.activate(&vpn.path, &vpn.name).await {
+                        error!("NetworkManager refused to activate {}: {e:#}", vpn.name);
+                    }
+                });
+            });
+        }
+
+        {
+            let session = session.clone();
+            let state = state.clone();
+            let handle = tokio_handle.clone();
             connection_view.disconnect_btn.connect_clicked(move |_| {
-                if let Some(tx) = tunnel_cmd_tx.borrow().as_ref() {
-                    if let Err(e) = tx.send(TunnelCommand::Disconnect) {
-                        error!("Failed to send disconnect command: {e}");
+                let active = {
+                    let current = state.lock().expect("state lock poisoned");
+                    match &*current {
+                        VpnState::Connected { path, name, .. } => {
+                            Some((path.clone(), name.clone()))
+                        }
+                        _ => None,
                     }
-                }
+                };
+                let Some((path, name)) = active else {
+                    error!("Disconnect pressed with no active DrayTek VPN");
+                    return;
+                };
+
+                let session = session.lock().expect("session lock poisoned").clone();
+                let Some(session) = session else {
+                    error!("No NetworkManager session available");
+                    return;
+                };
+                handle.spawn(async move {
+                    info!("Requesting NetworkManager to deactivate {name}");
+                    if let Err(e) = session.deactivate(&path).await {
+                        error!("NetworkManager refused to deactivate {name}: {e:#}");
+                    }
+                });
             });
         }
 
-        // Keepalive toggle button
-        {
-            let tunnel_cmd_tx = tunnel_cmd_tx.clone();
-            connection_view.keepalive_btn.connect_toggled(move |btn| {
-                let enabled = btn.is_active();
-                if enabled {
-                    btn.set_label("Keepalive: ON");
-                    btn.add_css_class("suggested-action");
-                } else {
-                    btn.set_label("Keepalive: OFF");
-                    btn.remove_css_class("suggested-action");
-                }
-                if let Some(tx) = tunnel_cmd_tx.borrow().as_ref() {
-                    if let Err(e) = tx.send(TunnelCommand::ToggleKeepalive(enabled)) {
-                        error!("Failed to send keepalive toggle: {e}");
-                    }
-                }
-            });
-        }
-
-        // Periodic UI update: drain status queue + refresh log (every 100ms)
+        // Draw whatever NM last reported, and keep the uptime and counters
+        // moving in between. The fingerprint check means a redraw happens on an
+        // actual state change rather than twice a second.
         {
             let connection_view = connection_view.clone();
             let log_view = log_view.clone();
-            let status_queue = status_queue.clone();
-            let profile_keepalive = profile_keepalive.clone();
-            gtk4::glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
-                // Drain status updates
-                let statuses: Vec<TunnelStatus> = {
-                    let mut q = status_queue.lock().expect("status queue lock poisoned");
-                    q.drain(..).collect()
-                };
-                for status in &statuses {
-                    connection_view.update_status(status);
-                    // Auto-enable keepalive if profile setting is on
-                    if matches!(status, TunnelStatus::Connected { .. }) && profile_keepalive.get() {
-                        connection_view.keepalive_btn.set_active(true);
+            let state = state.clone();
+            let saved = saved.clone();
+            let dropdown = dropdown.clone();
+            let selected = selected.clone();
+            let pending_edit = pending_edit.clone();
+            let session = session.clone();
+            let parent = window.clone();
+            let handle = tokio_handle.clone();
+            let mut last_drawn: Option<String> = None;
+            let mut last_saved: Vec<String> = Vec::new();
+            gtk4::glib::timeout_add_local(TICK_INTERVAL, move || {
+                // A profile finished loading; present the form now that we are
+                // back on the GTK thread.
+                let pending = pending_edit.lock().ok().and_then(|mut slot| slot.take());
+                if let Some((profile, path)) = pending {
+                    let Some(nm) = session.lock().ok().and_then(|s| s.clone()) else {
+                        error!("No NetworkManager session available");
+                        return gtk4::glib::ControlFlow::Continue;
+                    };
+                    let parent = parent.clone();
+                    let handle = handle.clone();
+                    profile_editor::show_editor(&parent, Some(profile), move |edited| {
+                        let handle = handle.clone();
+                        let nm = nm.clone();
+                        let path = path.clone();
+                        handle.spawn(async move {
+                            if let Err(e) = nm.update(&path, &edited).await {
+                                error!("Could not save {}: {e:#}", edited.name);
+                            }
+                        });
+                    });
+                }
+
+                let current = state.lock().expect("state lock poisoned").clone();
+                let fingerprint = format!("{current:?}");
+                if last_drawn.as_deref() != Some(fingerprint.as_str()) {
+                    last_drawn = Some(fingerprint);
+                    let view = StatusView::from(&current);
+                    let failure = match &current {
+                        VpnState::Failed { reason, .. } => Some(reason.as_str()),
+                        _ => None,
+                    };
+                    connection_view.update_status(&view, failure);
+                }
+
+                // Rebuild the dropdown only when the names differ, so a poll
+                // that found nothing new does not discard the user's selection.
+                let names: Vec<String> = saved
+                    .lock()
+                    .expect("saved lock poisoned")
+                    .iter()
+                    .map(|v| v.name.clone())
+                    .collect();
+                if names != last_saved {
+                    let keep = dropdown.selected() as usize;
+                    last_saved = names.clone();
+                    if !names.is_empty() {
+                        let borrowed: Vec<&str> = names.iter().map(String::as_str).collect();
+                        dropdown.set_model(Some(&gtk4::StringList::new(&borrowed)));
+                        let idx = keep.min(names.len() - 1);
+                        dropdown.set_selected(idx as u32);
+                        selected.set(idx);
+                    } else {
+                        dropdown.set_model(Some(&gtk4::StringList::new(&[] as &[&str])));
+                        dropdown.set_selected(gtk4::INVALID_LIST_POSITION);
                     }
                 }
 
-                // Update connection timer
                 connection_view.tick();
-
-                // Refresh log view
                 log_view.refresh();
-
                 gtk4::glib::ControlFlow::Continue
             });
         }
 
-        // Save selected profile on dropdown change
-        {
-            let config = app_config.clone();
-            profile_dropdown.connect_selected_notify(move |dd| {
-                // try_borrow_mut: skip save during programmatic updates (e.g. set_model)
-                // where the config is already borrowed
-                if let Ok(mut cfg) = config.try_borrow_mut() {
-                    let idx = dd.selected() as usize;
-                    cfg.last_selected = Some(idx);
-                    let _ = config::save_config(&cfg);
-                }
-            });
-        }
-
-        // Check for leftovers from a previous session that did not shut down
-        // cleanly. The endpoint pin is checked separately from the device: it is
-        // a host route, so it outlives the tunnel interface and can break
-        // connecting on a network the stale route has nothing to do with.
-        {
-            use crate::tunnel::privilege;
-
-            let device_present = privilege::is_device_present(privilege::TUN_DEVICE_NAME);
-            let pin_present = privilege::has_stale_pin();
-            let restore_dns = privilege::has_dns_backup();
-
-            if device_present || pin_present {
-                info!(
-                    "Stale tunnel detected: device {} {present}, endpoint pin {pin}, \
-                     DNS backup {dns}",
-                    privilege::TUN_DEVICE_NAME,
-                    present = if device_present { "present" } else { "gone" },
-                    pin = if pin_present { "present" } else { "gone" },
-                    dns = if restore_dns { "found" } else { "not found" },
-                );
-
-                let body = match (device_present, pin_present) {
-                    (true, true) => format!(
-                        "A tunnel device ({device}) and a route keeping the VPN server outside \
-                         the tunnel are both left over from a previous session. \
-                         This may affect your network. Clean them up?",
-                        device = privilege::TUN_DEVICE_NAME
-                    ),
-                    (true, false) => format!(
-                        "A tunnel device ({device}) from a previous session is still active. \
-                         This may affect your network. Clean it up?",
-                        device = privilege::TUN_DEVICE_NAME
-                    ),
-                    // No device, but the pin alone still sends the VPN server's
-                    // traffic down a gateway from a network you may no longer be on.
-                    _ => "A route keeping the VPN server outside the tunnel is left over from \
-                         a previous session. It points at the network you were on then, so \
-                         connecting from a different network will fail. Clean it up?"
-                        .to_string(),
-                };
-
-                let dialog = adw::AlertDialog::builder()
-                    .heading("Stale Tunnel Detected")
-                    .body(body)
-                    .build();
-                dialog.add_response("ignore", "Ignore");
-                dialog.add_response("cleanup", "Clean Up");
-                dialog.set_response_appearance("cleanup", adw::ResponseAppearance::Suggested);
-                dialog.set_default_response(Some("cleanup"));
-                dialog.set_close_response("ignore");
-
-                let handle = tokio_handle.clone();
-                dialog.connect_response(None, move |_, response| {
-                    if response == "cleanup" {
-                        info!("User chose to clean up stale tunnel");
-                        let device = privilege::TUN_DEVICE_NAME.to_string();
-                        handle.spawn(async move {
-                            privilege::teardown(&device, restore_dns).await;
-                        });
-                    } else {
-                        info!("User chose to ignore stale tunnel");
-                    }
-                });
-                dialog.present(Some(&window));
-            }
-        }
-
-        MainWindow { window }
+        window.set_content(Some(&toolbar_view));
+        Self { window }
     }
 }
