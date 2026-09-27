@@ -2,6 +2,7 @@
 ///
 /// Manages the full lifecycle: TLS connect → HTTP CONNECT → LCP → Auth → IPCP → data loop.
 use anyhow::{bail, Context, Result};
+use std::net::Ipv4Addr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -10,7 +11,8 @@ use draytek_vpn_protocol::connection;
 use draytek_vpn_protocol::constants::*;
 use draytek_vpn_protocol::endpoint;
 use draytek_vpn_protocol::engine_common::{
-    execute_actions, send_ppp_frame, PingKeeper, PppFsmPair, TrafficStats, TunnelAddrs,
+    execute_actions, send_ppp_frame, DataLoopOptions, DataPlaneWitness, PingKeeper, PppFsmPair,
+    TrafficStats, TunnelAddrs,
 };
 use draytek_vpn_protocol::keepalive::KeepaliveTracker;
 use draytek_vpn_protocol::negotiate::{self, NegotiationStatus};
@@ -160,27 +162,20 @@ async fn run_inner(
         None
     };
 
-    privilege::setup(
-        TUN_DEVICE_NAME,
-        neg.local_ip,
-        neg.remote_ip,
-        neg.mtu,
-        &routes,
+    // The helper pins the endpoint itself, before the default route goes in, so
+    // the two can never be reordered by a privilege-elevation prompt.
+    privilege::setup(privilege::SetupRequest {
+        device: TUN_DEVICE_NAME,
+        local_ip: neg.local_ip,
+        peer_ip: neg.remote_ip,
+        mtu: neg.mtu,
+        routes: &routes,
         default_gw,
-        neg.dns,
-    )
+        dns: neg.dns,
+        pin: endpoint_route.as_ref(),
+    })
     .await
     .context("Privileged tunnel setup failed")?;
-
-    // `setup` has just installed the default route, so the VPN server's own
-    // traffic is already being pulled into the tunnel. Pin it back onto the
-    // physical link straight away: this pin is what keeps the SSTP connection
-    // carrying the tunnel alive.
-    if let Some(route) = &endpoint_route {
-        if let Err(e) = privilege::pin_endpoint(route).await {
-            warn!("Failed to pin VPN endpoint: {e:#}");
-        }
-    }
 
     // Open TUN device (unprivileged — helper created it with user ownership)
     let tun = match tun_device::open_tun(TUN_DEVICE_NAME) {
@@ -226,9 +221,12 @@ async fn run_inner(
         &mut tls_stream,
         &mut neg.socket_buf,
         &mut fsms,
-        status_tx,
-        cmd_rx,
+        DataLoopOptions {
+            keepalive_ping: profile.keepalive,
+            report_effective_route: profile.default_gateway,
+        },
         addrs,
+        GuiChannels { status_tx, cmd_rx },
     )
     .await;
 
@@ -245,18 +243,65 @@ async fn run_inner(
     data_result
 }
 
+/// Log which device the kernel would actually send traffic out for, once the
+/// helper has finished installing the routes.
+///
+/// "Tunnel up, routes installed, no internet" has two very different causes: the
+/// default route lost to a competing one and traffic never leaves the physical
+/// link, or the route is in place and the router is dropping what arrives. This
+/// line tells the two apart without anyone having to reproduce it by hand.
+fn report_effective_routes() {
+    const PROBE_DEST: Ipv4Addr = Ipv4Addr::new(1, 1, 1, 1);
+    match endpoint::effective_route(PROBE_DEST) {
+        Some(route) if route.device == TUN_DEVICE_NAME => info!(
+            "Effective route for {PROBE_DEST}: via {} on {} — traffic goes through the tunnel",
+            route
+                .gateway
+                .map(|g| g.to_string())
+                .unwrap_or_else(|| "on-link".into()),
+            route.device
+        ),
+        Some(route) => warn!(
+            "Effective route for {PROBE_DEST}: via {} on {} — NOT the tunnel, so the default \
+             route did not take effect",
+            route
+                .gateway
+                .map(|g| g.to_string())
+                .unwrap_or_else(|| "on-link".into()),
+            route.device
+        ),
+        None => warn!("Could not determine the effective route for {PROBE_DEST}"),
+    }
+}
+
+/// The GUI side of the data loop: where status updates go and where commands
+/// arrive. Grouped so the loop signature stays within the project's argument
+/// budget without a suppression.
+struct GuiChannels<'a> {
+    status_tx: &'a GlibSender<TunnelStatus>,
+    cmd_rx: &'a mut mpsc::UnboundedReceiver<TunnelCommand>,
+}
+
 /// Run the data transfer loop until disconnect or error.
 async fn data_loop(
     tun: &tun_rs::AsyncDevice,
     tls_stream: &mut tokio_openssl::SslStream<tokio::net::TcpStream>,
     socket_buf: &mut bytes::BytesMut,
     fsms: &mut PppFsmPair,
-    status_tx: &GlibSender<TunnelStatus>,
-    cmd_rx: &mut mpsc::UnboundedReceiver<TunnelCommand>,
+    options: DataLoopOptions,
     addrs: TunnelAddrs,
+    gui: GuiChannels<'_>,
 ) -> Result<()> {
     info!("Entering data transfer loop");
     let mut keepalive = KeepaliveTracker::new();
+    let mut witness = DataPlaneWitness::default();
+    // The helper installs every route synchronously before this point, so the
+    // table is already final here and there is nothing to wait for. Reported
+    // outside the loop for the same reason the NM plugin reports on a wall
+    // clock: a keepalive tick never fires on a busy tunnel.
+    if options.report_effective_route {
+        report_effective_routes();
+    }
     // Size from the negotiated MTU. A fixed 1500-byte buffer would panic on
     // `&tun_buf[..n]`: the kernel reports the true packet length even when the
     // read did not fit, and MTU is configurable up to 9000.
@@ -264,6 +309,9 @@ async fn data_loop(
     let mut read_buf = [0u8; READ_BUF_SIZE];
     let mut stats = TrafficStats::new(addrs.mtu);
     let mut ping = PingKeeper::new(addrs.local_ip, addrs.remote_ip);
+    if options.keepalive_ping {
+        ping.set_enabled(true);
+    }
 
     loop {
         let keepalive_delay = keepalive.next_check_duration();
@@ -276,6 +324,7 @@ async fn data_loop(
                 if n > 0 {
                     keepalive.mark_tun_activity();
                     stats.record_tx(n);
+                    witness.on_tun_tx(n);
                     let ip_packet = &tun_buf[..n];
                     let ppp_frame = PppFrame::ipv4(ip_packet.to_vec());
                     send_ppp_frame(&ppp_frame, tls_stream).await
@@ -303,6 +352,7 @@ async fn data_loop(
                     }
                     if sstp.is_reply() {
                         keepalive.received_reply();
+                        witness.on_keepalive_reply();
                         continue;
                     }
                     if sstp.is_request() {
@@ -319,6 +369,7 @@ async fn data_loop(
                     if ppp.is_ipv4() {
                         // Write IP packet to TUN
                         stats.record_rx(ppp.information.len());
+                        witness.on_tunnel_rx(ppp.information.len());
                         let tun_write: std::io::Result<usize> = tun.send(&ppp.information).await;
                         tun_write.context("Failed to write IP packet to TUN")?;
                     } else if ppp.is_lcp() {
@@ -370,7 +421,7 @@ async fn data_loop(
                 }
 
                 if stats.should_send_update() {
-                    status_tx.send(TunnelStatus::Stats {
+                    gui.status_tx.send(TunnelStatus::Stats {
                         bytes_tx: stats.bytes_tx,
                         bytes_rx: stats.bytes_rx,
                         packets_tx: stats.packets_tx,
@@ -390,11 +441,11 @@ async fn data_loop(
             }
 
             // Commands from UI
-            cmd = cmd_rx.recv() => {
+            cmd = gui.cmd_rx.recv() => {
                 match cmd {
                     Some(TunnelCommand::Disconnect) | None => {
                         info!("Disconnect requested");
-                        status_tx.send(TunnelStatus::Disconnecting);
+                        gui.status_tx.send(TunnelStatus::Disconnecting);
                         // Send LCP terminate
                         let actions = fsms.lcp.handle_event(FsmEvent::Close);
                         execute_actions(&actions, PPP_LCP, fsms.lcp.tag, tls_stream).await?;

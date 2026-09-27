@@ -20,8 +20,8 @@ use draytek_vpn_protocol::connection;
 use draytek_vpn_protocol::constants::*;
 use draytek_vpn_protocol::endpoint;
 use draytek_vpn_protocol::engine_common::{
-    execute_actions, send_ppp_frame, send_ppp_frame_cancellable, PingKeeper, PppFsmPair,
-    TrafficStats, TunnelAddrs, WriteOutcome,
+    execute_actions, send_ppp_frame, send_ppp_frame_cancellable, DataLoopOptions, DataPlaneWitness,
+    PingKeeper, PppFsmPair, TrafficStats, TunnelAddrs, WriteOutcome,
 };
 use draytek_vpn_protocol::keepalive::KeepaliveTracker;
 use draytek_vpn_protocol::negotiate::{self, NegotiationStatus};
@@ -490,9 +490,12 @@ async fn run_tunnel(
         &mut tls_stream,
         &mut neg.socket_buf,
         &mut fsms,
+        DataLoopOptions {
+            keepalive_ping: profile.keepalive,
+            report_effective_route: profile.default_gateway,
+        },
         addrs,
         &mut cancel,
-        profile.keepalive,
     )
     .await;
 
@@ -510,18 +513,64 @@ async fn run_tunnel(
     data_result
 }
 
+/// Log which device the kernel would actually send traffic out for, once NM has
+/// finished installing the routes this connection asked for.
+///
+/// "Tunnel up, routes installed, no internet" has two very different causes:
+/// the default route lost to a competing one and traffic never leaves the
+/// physical link, or the route is in place and the router is dropping what
+/// arrives. This line tells the two apart without anyone having to reproduce it
+/// by hand.
+fn report_effective_routes() {
+    const PROBE_DEST: Ipv4Addr = Ipv4Addr::new(1, 1, 1, 1);
+    match endpoint::effective_route(PROBE_DEST) {
+        Some(route) if route.device == TUN_DEVICE_NAME => info!(
+            "Effective route for {PROBE_DEST}: via {} on {} — traffic goes through the tunnel",
+            route
+                .gateway
+                .map(|g| g.to_string())
+                .unwrap_or_else(|| "on-link".into()),
+            route.device
+        ),
+        Some(route) => warn!(
+            "Effective route for {PROBE_DEST}: via {} on {} — NOT the tunnel, so the default \
+             route did not take effect",
+            route
+                .gateway
+                .map(|g| g.to_string())
+                .unwrap_or_else(|| "on-link".into()),
+            route.device
+        ),
+        None => warn!("Could not determine the effective route for {PROBE_DEST}"),
+    }
+}
+
+/// How long after `ip4_config` to report the effective route.
+///
+/// NM derives and installs routes from that signal asynchronously, so the table
+/// is briefly behind what the plugin asked for. Long enough for the round trip
+/// to complete, short enough to still be in the log next to the connect.
+const ROUTE_REPORT_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Data transfer loop for the NM plugin.
 async fn data_loop(
     tun: &tun_rs::AsyncDevice,
     tls_stream: &mut tokio_openssl::SslStream<tokio::net::TcpStream>,
     socket_buf: &mut BytesMut,
     fsms: &mut PppFsmPair,
+    options: DataLoopOptions,
     addrs: TunnelAddrs,
     cancel: &mut watch::Receiver<bool>,
-    keepalive_enabled: bool,
 ) -> Result<()> {
     info!("Entering data transfer loop");
     let mut keepalive = KeepaliveTracker::new();
+    let mut witness = DataPlaneWitness::default();
+    // Reported on a wall clock, not from the keepalive tick: that tick only
+    // fires once the tunnel has been idle, which is exactly the case where
+    // "where does my traffic go" is least interesting. A busy tunnel would
+    // never report at all.
+    let route_report_at = tokio::time::Instant::now() + ROUTE_REPORT_DELAY;
+    let mut reported_routes = false;
     // Size from the negotiated MTU. A fixed 1500-byte buffer would panic on
     // `&tun_buf[..n]`: the kernel reports the true packet length even when the
     // read did not fit, and MTU is configurable up to 9000.
@@ -529,7 +578,7 @@ async fn data_loop(
     let mut read_buf = [0u8; READ_BUF_SIZE];
     let mut stats = TrafficStats::new(addrs.mtu);
     let mut ping = PingKeeper::new(addrs.local_ip, addrs.remote_ip);
-    if keepalive_enabled {
+    if options.keepalive_ping {
         ping.set_enabled(true);
     }
 
@@ -542,8 +591,20 @@ async fn data_loop(
         }
 
         let keepalive_delay = keepalive.next_check_duration();
+        // Recomputed every iteration, so it shrinks monotonically towards the
+        // fixed deadline above rather than restarting each time round the loop.
+        let until_route_report =
+            route_report_at.saturating_duration_since(tokio::time::Instant::now());
 
         tokio::select! {
+            // Report where the kernel actually sends traffic, once the routes
+            // have settled. `biased` is not used: this must never outrank the
+            // actual data path.
+            _ = tokio::time::sleep(until_route_report), if !reported_routes && options.report_effective_route => {
+                reported_routes = true;
+                report_effective_routes();
+            }
+
             // Read from TUN device
             tun_result = tun.recv(&mut tun_buf) => {
                 let tun_result: std::io::Result<usize> = tun_result;
@@ -551,6 +612,7 @@ async fn data_loop(
                 if n > 0 {
                     keepalive.mark_tun_activity();
                     stats.record_tx(n);
+                    witness.on_tun_tx(n);
                     let ip_packet = &tun_buf[..n];
                     let ppp_frame = PppFrame::ipv4(ip_packet.to_vec());
                     if send_ppp_frame_cancellable(&ppp_frame, tls_stream, cancel).await?
@@ -581,6 +643,7 @@ async fn data_loop(
                     }
                     if sstp.is_reply() {
                         keepalive.received_reply();
+                        witness.on_keepalive_reply();
                         continue;
                     }
                     if sstp.is_request() {
@@ -596,6 +659,7 @@ async fn data_loop(
 
                     if ppp.is_ipv4() {
                         stats.record_rx(ppp.information.len());
+                        witness.on_tunnel_rx(ppp.information.len());
                         // Hand the packet to the TUN, but not if a disconnect
                         // has been requested: a write into a TUN nobody is
                         // draining would block just as long as a stalled socket.

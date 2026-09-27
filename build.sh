@@ -183,6 +183,14 @@ nm_install() {
     sudo install -m 644 networkmanager/data/nm-draytek-service.conf \
         "$DBUS_CONF_DIR/"
 
+    # The VPN plugin is a D-Bus activated service, not a child of NetworkManager
+    # in any meaningful sense: it holds the well-known name and survives
+    # `systemctl restart NetworkManager`, which then reconnects to the *old*
+    # process. The freshly installed binary is never loaded, so the next connect
+    # silently runs the previous build. Kill leftovers before restarting.
+    info "Stopping any running VPN plugin instance..."
+    sudo pkill -f nm-draytek-service 2>/dev/null || true
+
     info "Restarting NetworkManager..."
     sudo systemctl restart NetworkManager
     info "Installed. DrayTek SSL VPN should appear in GNOME Settings > VPN."
@@ -206,6 +214,10 @@ nm_uninstall() {
     sudo rm -f "$NM_VPN_DIR/nm-draytek-service.name"
     sudo rm -f "$DBUS_CONF_DIR/nm-draytek-service.conf"
     sudo rm -f /etc/NetworkManager/dispatcher.d/90-draytek-vpn-tray
+
+    # Same reason as nm_install: the activated service outlives the files it was
+    # started from, and would keep serving from the deleted inode.
+    sudo pkill -f nm-draytek-service 2>/dev/null || true
 
     info "Restarting NetworkManager..."
     sudo systemctl restart NetworkManager

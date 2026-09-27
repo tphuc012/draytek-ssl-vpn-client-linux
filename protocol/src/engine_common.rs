@@ -23,6 +23,19 @@ pub struct TunnelAddrs {
     pub remote_ip: Ipv4Addr,
 }
 
+/// What the data loop should do beyond moving packets.
+#[derive(Clone, Copy, Default)]
+pub struct DataLoopOptions {
+    /// Send periodic ICMP pings so the router does not idle the tunnel out.
+    pub keepalive_ping: bool,
+    /// Log the kernel's effective route once the routing table has settled.
+    ///
+    /// Only meaningful when this connection becomes the default route: that is
+    /// the one mode where "which device will my packets leave by" is in
+    /// question, and where "no internet" has more than one possible cause.
+    pub report_effective_route: bool,
+}
+
 /// Send a PPP frame wrapped in SSTP over the TLS stream.
 pub async fn send_ppp_frame<S: tokio::io::AsyncWrite + Unpin>(
     frame: &PppFrame,
@@ -78,6 +91,49 @@ pub async fn send_ppp_frame_cancellable<S: tokio::io::AsyncWrite + Unpin>(
 
 /// How long a single tunnel write may block before it is abandoned.
 const WRITE_TIMEOUT_SECS: u64 = 10;
+
+/// One-shot data-plane milestones, each logged the first time it happens.
+///
+/// A tunnel that negotiates, gets its routes installed and then reaches nothing
+/// looks identical from the outside: no error, no warning, just no internet. These
+/// three lines are what separate "the control path is alive and the router is
+/// dropping our traffic" from "the control path itself is dead" in the journal.
+#[derive(Default)]
+pub struct DataPlaneWitness {
+    logged_tx: bool,
+    logged_rx: bool,
+    logged_reply: bool,
+}
+
+impl DataPlaneWitness {
+    /// A packet was read from the TUN and handed to the tunnel.
+    pub fn on_tun_tx(&mut self, bytes: usize) {
+        if !self.logged_tx {
+            self.logged_tx = true;
+            info!("Data plane: first {bytes} bytes queued into the tunnel");
+        }
+    }
+
+    /// A packet arrived from the tunnel and is being written to the TUN.
+    pub fn on_tunnel_rx(&mut self, bytes: usize) {
+        if !self.logged_rx {
+            self.logged_rx = true;
+            info!("Data plane: first {bytes} bytes received from the tunnel");
+        }
+    }
+
+    /// The server answered an SSTP keepalive REQUEST.
+    ///
+    /// The strongest single proof that the control path survived: it is a round
+    /// trip over the very connection a default route would otherwise pull into
+    /// the tunnel it is carrying.
+    pub fn on_keepalive_reply(&mut self) {
+        if !self.logged_reply {
+            self.logged_reply = true;
+            info!("Data plane: control path confirmed — server answered keepalive");
+        }
+    }
+}
 
 /// Execute FSM actions: send frames and check for shutdown/layer-up.
 pub async fn execute_actions<S: tokio::io::AsyncWrite + Unpin>(

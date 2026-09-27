@@ -110,35 +110,7 @@ fn needs_pkexec() -> bool {
     })
 }
 
-/// Pin the VPN server's own address to the physical link.
-///
-/// Must run before the tunnel's default route is installed. Once every packet
-/// is routed into the tunnel, the SSTP connection carrying it is pulled in too
-/// and the tunnel tears itself down. See `protocol::endpoint` for details.
-pub async fn pin_endpoint(route: &endpoint::EndpointRoute) -> Result<()> {
-    let helper = find_helper()?;
-    let mut args = vec![
-        helper,
-        "pin-endpoint".to_string(),
-        "--ip".to_string(),
-        route.server.to_string(),
-        "--device".to_string(),
-        route.device.clone(),
-    ];
-    if let Some(gateway) = route.gateway {
-        args.push("--gateway".to_string());
-        args.push(gateway.to_string());
-    }
-
-    let output = run_helper(args).await?;
-    if !output.status.success() {
-        anyhow::bail!("Failed to pin VPN endpoint (exit {})", output.status);
-    }
-    info!("Pinned VPN endpoint {} on {}", route.server, route.device);
-    Ok(())
-}
-
-/// Remove a pin installed by [`pin_endpoint`]. Best-effort.
+/// Remove a pin installed as part of [`setup`]. Best-effort.
 pub async fn unpin_endpoint(server: Ipv4Addr) {
     let helper = match find_helper() {
         Ok(h) => h,
@@ -182,18 +154,45 @@ async fn run_helper(args: Vec<String>) -> Result<std::process::Output> {
     }
 }
 
+/// Everything the helper needs to build the tunnel's network configuration.
+///
+/// Mirrors the helper's own `SetupArgs`, so the translation from one to the
+/// other is a straight walk over the fields.
+pub struct SetupRequest<'a> {
+    pub device: &'a str,
+    pub local_ip: Ipv4Addr,
+    pub peer_ip: Ipv4Addr,
+    pub mtu: u16,
+    /// Subnets to route through the tunnel.
+    pub routes: &'a [String],
+    /// Next hop to become the default route, when this profile is a full tunnel.
+    pub default_gw: Option<Ipv4Addr>,
+    /// DNS server the router handed out over IPCP.
+    pub dns: Option<Ipv4Addr>,
+    /// How the VPN server was reached *before* the tunnel existed.
+    ///
+    /// When set, the helper installs a host route for it before the default
+    /// route goes in — see `protocol::endpoint` for why the ordering matters.
+    /// Passing it in rather than pinning separately means privilege elevation
+    /// cannot open a window where the control connection is already misrouted.
+    pub pin: Option<&'a endpoint::EndpointRoute>,
+}
+
 /// Set up the TUN device, routing, and DNS via the privileged helper.
 ///
 /// If the helper has CAP_NET_ADMIN, runs directly. Otherwise uses pkexec.
-pub async fn setup(
-    device: &str,
-    local_ip: Ipv4Addr,
-    peer_ip: Ipv4Addr,
-    mtu: u16,
-    routes: &[String],
-    default_gw: Option<Ipv4Addr>,
-    dns: Option<Ipv4Addr>,
-) -> Result<()> {
+pub async fn setup(request: SetupRequest<'_>) -> Result<()> {
+    let SetupRequest {
+        device,
+        local_ip,
+        peer_ip,
+        mtu,
+        routes,
+        default_gw,
+        dns,
+        pin,
+    } = request;
+
     let helper = find_helper()?;
     let uid = current_uid();
 
@@ -231,6 +230,17 @@ pub async fn setup(
     if let Some(dns_ip) = dns {
         args.push("--dns".to_string());
         args.push(dns_ip.to_string());
+    }
+
+    if let Some(pin) = pin {
+        args.push("--pin-ip".to_string());
+        args.push(pin.server.to_string());
+        args.push("--pin-device".to_string());
+        args.push(pin.device.clone());
+        if let Some(gw) = pin.gateway {
+            args.push("--pin-gateway".to_string());
+            args.push(gw.to_string());
+        }
     }
 
     let output = run_helper(args).await?;

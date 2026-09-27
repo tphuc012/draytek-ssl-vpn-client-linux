@@ -44,6 +44,18 @@ struct SetupArgs {
     routes: Vec<String>,
     default_gw: Option<Ipv4Addr>,
     dns: Option<Ipv4Addr>,
+    /// Host route that keeps the VPN server reachable outside the tunnel.
+    /// Installed before the default route, never after — see `cmd_setup`.
+    pin: Option<PinArgs>,
+}
+
+struct PinArgs {
+    /// Address of the VPN server to pin.
+    ip: Ipv4Addr,
+    /// Next hop towards it, when the route is not directly connected.
+    gateway: Option<Ipv4Addr>,
+    /// Interface that reached it before the tunnel existed.
+    device: String,
 }
 
 struct TeardownArgs {
@@ -60,6 +72,9 @@ fn parse_setup_args(args: &[String]) -> Result<SetupArgs, Box<dyn std::error::Er
     let mut routes = Vec::new();
     let mut default_gw = None;
     let mut dns = None;
+    let mut pin_ip = None;
+    let mut pin_gateway = None;
+    let mut pin_device = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -120,10 +135,46 @@ fn parse_setup_args(args: &[String]) -> Result<SetupArgs, Box<dyn std::error::Er
                         .parse::<Ipv4Addr>()?,
                 );
             }
+            "--pin-ip" => {
+                i += 1;
+                pin_ip = Some(
+                    args.get(i)
+                        .ok_or("--pin-ip requires a value")?
+                        .parse::<Ipv4Addr>()?,
+                );
+            }
+            "--pin-gateway" => {
+                i += 1;
+                pin_gateway = Some(
+                    args.get(i)
+                        .ok_or("--pin-gateway requires a value")?
+                        .parse::<Ipv4Addr>()?,
+                );
+            }
+            "--pin-device" => {
+                i += 1;
+                pin_device = Some(args.get(i).ok_or("--pin-device requires a value")?.clone());
+            }
             other => return Err(format!("Unknown option: {other}").into()),
         }
         i += 1;
     }
+
+    // The pin is all-or-nothing: half a pin silently fails to install and the
+    // tunnel then routes the SSTP connection into itself.
+    let pin = match (pin_ip, pin_device) {
+        (Some(ip), Some(device)) => Some(PinArgs {
+            ip,
+            gateway: pin_gateway,
+            device,
+        }),
+        (None, None) => None,
+        _ => {
+            return Err("--pin-ip and --pin-device must be supplied together"
+                .to_string()
+                .into())
+        }
+    };
 
     Ok(SetupArgs {
         device: device.ok_or("--device is required")?,
@@ -134,6 +185,7 @@ fn parse_setup_args(args: &[String]) -> Result<SetupArgs, Box<dyn std::error::Er
         routes,
         default_gw,
         dns,
+        pin,
     })
 }
 
@@ -173,6 +225,25 @@ fn validate_device_name(name: &str) -> Result<(), Box<dyn std::error::Error>> {
     }
     if !name.chars().all(|c| c.is_ascii_alphanumeric()) {
         return Err(format!("Device name must be alphanumeric: '{name}'").into());
+    }
+    Ok(())
+}
+
+/// Validate a physical interface name coming from the kernel.
+///
+/// Wider than [`validate_device_name`] because that one only ever sees our own
+/// short TUN name, while this sees names the kernel handed us. The device
+/// reaches `ip` as a separate argv element, so the check keeps shell
+/// metacharacters and whitespace out of it.
+fn validate_iface_name(name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    if name.is_empty() || name.len() > 15 {
+        return Err(format!("Interface name must be 1-15 characters, got '{name}'").into());
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
+    {
+        return Err(format!("Invalid interface name: {name}").into());
     }
     Ok(())
 }
@@ -297,29 +368,29 @@ fn cmd_pin_endpoint(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
     let server = server.ok_or("--ip is required")?;
     let device = device.ok_or("--device is required")?;
-    // The device name reaches `ip` as a separate argv element, so validate it
-    // against the same character set used elsewhere. Interface names may
-    // contain `.`, `-` and `_`, which `validate_device_name` rejects because it
-    // only ever sees our own short TUN name.
-    if !device
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
-    {
-        return Err(format!("Invalid device name: {device}").into());
-    }
+    validate_iface_name(&device)?;
 
-    let cidr = format!("{server}/32");
+    install_pin(&PinArgs {
+        ip: server,
+        gateway,
+        device,
+    })
+}
+
+/// Install the host route that keeps the VPN server outside the tunnel.
+fn install_pin(pin: &PinArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let cidr = format!("{}/32", pin.ip);
     let mut owned: Vec<String> = vec!["route".into(), "replace".into(), cidr.clone()];
-    if let Some(gw) = gateway {
+    if let Some(gw) = pin.gateway {
         owned.push("via".into());
         owned.push(gw.to_string());
     }
     owned.push("dev".into());
-    owned.push(device.clone());
+    owned.push(pin.device.clone());
     let borrowed: Vec<&str> = owned.iter().map(String::as_str).collect();
 
     run_cmd("ip", &borrowed)?;
-    eprintln!("Pinned VPN endpoint {cidr} on {device}");
+    eprintln!("Pinned VPN endpoint {cidr} on {}", pin.device);
     Ok(())
 }
 
@@ -360,13 +431,14 @@ fn cmd_setup(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     for route in &setup.routes {
         validate_cidr(route)?;
     }
+    if let Some(pin) = &setup.pin {
+        validate_iface_name(&pin.device)?;
+    }
 
     let uid_str = setup.uid.to_string();
     let local_ip_str = setup.local_ip.to_string();
     let peer_ip_str = setup.peer_ip.to_string();
     let mtu_str = setup.mtu.to_string();
-    let addr_spec = format!("{local_ip_str} peer {peer_ip_str}");
-    let _ = addr_spec; // used below via individual parts
 
     // 1. Create TUN device owned by user (remove stale device from prior session if present)
     if std::path::Path::new(&format!("/sys/class/net/{}", setup.device)).exists() {
@@ -407,19 +479,32 @@ fn cmd_setup(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     // 3. Set MTU and bring up
     run_cmd("ip", &["link", "set", &setup.device, "mtu", &mtu_str, "up"])?;
 
-    // 4. Add routes
-    for route in &setup.routes {
-        run_cmd("ip", &["route", "add", route, "dev", &setup.device])?;
+    // 4. Pin the VPN server outside the tunnel — strictly before the default
+    //    route goes in. Once every packet is routed into the tunnel, the SSTP
+    //    connection carrying it is pulled in too, the server cannot return its
+    //    own control traffic, and the tunnel tears itself down while the
+    //    default route still points at it. Doing it here rather than from the
+    //    caller keeps the ordering guaranteed even when privilege elevation
+    //    needs a prompt.
+    if let Some(pin) = &setup.pin {
+        install_pin(pin)?;
     }
 
-    // 5. Default gateway
+    // 5. Add routes. `replace`, not `add`: a route left behind by a session
+    //    that died without tearing down would make `add` fail with "File
+    //    exists" and abort the whole setup.
+    for route in &setup.routes {
+        run_cmd("ip", &["route", "replace", route, "dev", &setup.device])?;
+    }
+
+    // 6. Default gateway
     if let Some(gw) = setup.default_gw {
         let gw_str = gw.to_string();
         run_cmd(
             "ip",
             &[
                 "route",
-                "add",
+                "replace",
                 "default",
                 "via",
                 &gw_str,
@@ -429,7 +514,7 @@ fn cmd_setup(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         )?;
     }
 
-    // 6. DNS configuration
+    // 7. DNS configuration
     if let Some(dns_ip) = setup.dns {
         if try_resolvectl_dns_setup(&setup.device, dns_ip) {
             eprintln!("DNS configured via resolvectl for {}", setup.device);

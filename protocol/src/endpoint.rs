@@ -142,6 +142,17 @@ pub fn unpin(route: &EndpointRoute) {
         .output();
 }
 
+/// Report which route the kernel actually uses to reach `dest` right now.
+///
+/// Diagnostic only. Becoming the default route is asynchronous — the plugin hands
+/// its config to NetworkManager and NM installs the route a moment later — so the
+/// route table can only be inspected after the fact. "Which device would my
+/// packets leave by" is the single fact that distinguishes a routing failure from
+/// a router that refuses to forward.
+pub fn effective_route(dest: Ipv4Addr) -> Option<EndpointRoute> {
+    probe(dest).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

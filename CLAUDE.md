@@ -76,6 +76,8 @@ Both the library (`protocol/`) and the binaries use `anyhow::Result` end-to-end.
 - **C editor keys must match Rust `parse_settings`** — any new `vpn.data` key needs a matching `#define NM_DRAYTEK_KEY_*` in `networkmanager/editor/nm-draytek-editor.h` AND a read/write in the `.c` file AND a parser in `networkmanager/src/tunnel.rs::parse_settings`. Mismatches silently drop data.
 - **NM plugin runs as root under NetworkManager**; stdin is closed and stderr goes to journald. Don't expect `println!` — use `tracing::{info,warn,error}!`.
 - **`tokio::select!` macro hygiene** brings `std::pin::Pin` into scope inside its branches. Prefer a fully-qualified `std::pin::Pin::new(...)` at the call site so the behaviour doesn't depend on macro internals.
+- **The VPN plugin is a D-Bus activated service and survives `systemctl restart NetworkManager`.** It holds the well-known name, so NM reconnects to the *old* process and the freshly installed `nm-draytek-service` is never loaded — a reinstall silently tests the previous build. `build.sh nm install` now `pkill`s leftovers first. After a manual install, verify with `ps -o pid,lstart,cmd -p "$(pgrep -f nm-draytek-service)"`: the start time must be *after* the install. Note the data-path binary is `/usr/lib/NetworkManager/nm-draytek-service` (7 MB), **not** `libnm-vpn-plugin-draytek.so` in `$NM_PLUGIN_DIR` (18 KB, the libnm capability shim) — checking the `.so` timestamp tells you nothing about whether the running code is current.
+- **The one-line log that tells you which build is live:** HEAD logs `VPN endpoint ... is reached via ...` on every connect. If it is absent from the journal, the running process predates the endpoint-pin work.
 
 ## Key Source Files
 
