@@ -77,6 +77,29 @@ func runAdmin(_ shell: String) -> (ok: Bool, output: String) {
     return (true, result.stringValue ?? "")
 }
 
+// MARK: - VPN service control (macOS network services, via scutil --nc)
+
+struct VPNService: Hashable { let name: String; let kind: String }
+
+func listVPNServices() -> [VPNService] {
+    let out = run("/usr/sbin/scutil", ["--nc", "list"])
+    guard let re = try? NSRegularExpression(pattern: #"\s[0-9A-Fa-f-]{36}\s+VPN\s+\(([^)]*)\)\s+"([^"]+)""#) else { return [] }
+    var res: [VPNService] = []
+    for line in out.split(separator: "\n") {
+        let l = String(line), ns = l as NSString
+        if let m = re.firstMatch(in: l, range: NSRange(location: 0, length: ns.length)) {
+            res.append(VPNService(name: ns.substring(with: m.range(at: 2)), kind: ns.substring(with: m.range(at: 1))))
+        }
+    }
+    // Draytek first
+    return res.sorted { ($0.kind.lowercased().contains("draytek") ? 0 : 1) < ($1.kind.lowercased().contains("draytek") ? 0 : 1) }
+}
+
+func vpnStatus(_ name: String) -> String {
+    run("/usr/sbin/scutil", ["--nc", "status", name]).split(separator: "\n").first
+        .map { $0.trimmingCharacters(in: .whitespaces) } ?? "Unknown"
+}
+
 // MARK: - Model
 
 @MainActor
@@ -90,6 +113,16 @@ final class Model: ObservableObject {
     @Published var routes: String = ""
     @Published var busy = false
     @Published var showHelp = false
+    @Published var screen = 0   // 0 = VPN on/off, 1 = Settings
+    @Published var vpnServices: [VPNService] = []
+    @Published var vpnState = "Unknown"
+    @Published var vpnName: String {
+        didSet { UserDefaults.standard.set(vpnName, forKey: "vpnName"); vpnState = vpnName.isEmpty ? "No VPN configured" : vpnStatus(vpnName) }
+    }
+    @Published var autoRoute: Bool {
+        didSet { UserDefaults.standard.set(autoRoute, forKey: "autoRoute") }
+    }
+    var vpnConnected: Bool { vpnState == "Connected" }
 
     private let fileURL: URL = {
         let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -99,12 +132,15 @@ final class Model: ObservableObject {
     }()
 
     init() {
+        vpnName = UserDefaults.standard.string(forKey: "vpnName") ?? ""
+        autoRoute = UserDefaults.standard.object(forKey: "autoRoute") as? Bool ?? true
         if let text = try? String(contentsOf: fileURL, encoding: .utf8) {
             ips = text.split(whereSeparator: \.isNewline).map { String($0).trimmingCharacters(in: .whitespaces).lowercased() }.filter(isValidEntry)
         } else {
             ips = defaultIPs
             save()
         }
+        refreshVPN()
         refreshInterfaces()
         refreshRoutes()
     }
@@ -162,6 +198,62 @@ final class Model: ObservableObject {
         }
     }
 
+    func refreshVPN() {
+        vpnServices = listVPNServices()
+        if !vpnServices.contains(where: { $0.name == vpnName }) { vpnName = vpnServices.first?.name ?? "" }
+        else { vpnState = vpnStatus(vpnName) }
+    }
+
+    /// Connect (and optionally add routes afterwards) or disconnect the selected VPN service.
+    func toggleVPN() {
+        let name = vpnName
+        guard !name.isEmpty else { return }
+        let connecting = !vpnConnected
+        let auto = autoRoute
+        refreshInterfaces()   // fresh snapshot so only the interface created by this connect counts as new
+        let before = Set(vpnCandidates)
+        busy = true
+        append(connecting ? "▶ Connecting \"\(name)\"…" : "▶ Disconnecting \"\(name)\"…")
+        Task.detached {
+            let out = run("/usr/sbin/scutil", ["--nc", connecting ? "start" : "stop", name]).trimmingCharacters(in: .whitespacesAndNewlines)
+            let want = connecting ? "Connected" : "Disconnected"
+            var state = vpnStatus(name)
+            var waited = 0
+            while state != want && waited < 60 {
+                await MainActor.run { self.vpnState = state }
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                waited += 1
+                state = vpnStatus(name)
+            }
+            await MainActor.run {
+                self.vpnState = state
+                if !out.isEmpty { self.append(out) }
+                self.append(state == want ? "✓ \(state)" : "✗ Timed out, state is: \(state)")
+            }
+            guard connecting, state == want else {
+                await MainActor.run { self.busy = false; self.refreshInterfaces() }
+                return
+            }
+            // wait for the new utun interface (with an IPv4) to show up
+            var found: String?
+            for _ in 0..<15 {
+                found = await MainActor.run { () -> String? in
+                    self.refreshInterfaces()
+                    return self.vpnCandidates.last(where: { !before.contains($0) })
+                }
+                if found != nil { break }
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+            }
+            await MainActor.run {
+                self.busy = false
+                if let f = found { self.iface = f; self.append("• VPN interface: \(f) (\(self.ifaceIPs[f] ?? "?"))") }
+                guard auto else { return }
+                if found != nil { self.apply(add: true) }
+                else { self.append("✗ New VPN interface not detected; routes were not added. Pick it in Settings and click Add routes.") }
+            }
+        }
+    }
+
     func append(_ s: String) { log += (log.isEmpty ? "" : "\n") + s }
 
     func apply(add: Bool) {
@@ -215,7 +307,7 @@ struct HelpView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack {
-                Text("Draytek Custom Route — Guide").font(.title2).bold()
+                Text("Draytek VPN Custom Route — Guide").font(.title2).bold()
                 Spacer()
                 Button("Close") { dismiss() }.keyboardShortcut(.cancelAction)
             }.padding([.horizontal, .top], 20).padding(.bottom, 10)
@@ -224,10 +316,10 @@ struct HelpView: View {
                 VStack(alignment: .leading, spacing: 16) {
                     section("What does this app do?",
                             "When connected to a VPN (Draytek), only some traffic goes through the VPN by default. This app forces specific IPs or domains through the VPN network interface (utunX) by adding static routes on your Mac, instead of typing `sudo route` commands by hand.")
-                    section("Quick start",
-                            "1. Connect to the VPN first.\n2. Open the app: it finds the VPN interface automatically (a utunX with an IP address) and shows a green \"VPN found\" line. You do not need to know what utun is. If the orange line says no VPN was found, turn on the VPN and click ⟳.\n3. Type an IP or domain in the list field and click + (or press Enter).\n4. Click Add routes and enter your Mac password when macOS asks.\n5. Check the \"Current routes\" section to confirm the routes were added.")
+                    section("Quick start (two screens: VPN and Settings)",
+                            "1. On the VPN screen, click Turn VPN ON (or connect from Smart VPN yourself). With \"Add routes automatically after connecting\" ticked, routes are added right after the VPN comes up.\n2. Open the app: it finds the VPN interface automatically (a utunX with an IP address) and shows a green \"VPN found\" line. You do not need to know what utun is. If the orange line says no VPN was found, turn on the VPN and click ⟳.\n3. In Settings, type an IP or domain in the list field and click + (or press Enter).\n4. Click Add routes and enter your Mac password when macOS asks.\n5. Check the \"Current routes\" section to confirm the routes were added.")
                     section("Features",
-                            "• VPN interface: detected automatically. A VPN is a utun interface with an IP address (shown as \"VPN 10.x.x.x\"); utun entries marked \"(system)\" are not VPNs. It is re-detected every time you return to the app window. If several VPNs are active, pick one manually in the dropdown. To check yourself: run `ifconfig | grep -A3 utun` in Terminal and look for a utun with an `inet` line.\n• IP / domain list: enter an IPv4 address (8.8.8.8) or a domain (github.com). Pasting a full URL works too; the app extracts the domain. The list is saved automatically and is still there next time.\n• Add routes: adds routes via the selected interface for the whole list, asking for the password only once.\n• Delete routes: removes those routes; use it when disconnecting the VPN or to restore the original state.\n• Current routes: shows the routing-table entries matching your list. Click ⟳ to refresh.\n• Log: the result of each command, including errors and the IPs a domain resolved to.")
+                            "• VPN connection: lists the VPNs configured in macOS (Draytek Smart VPN first) and connects or disconnects the selected one using `scutil --nc`. No admin password is needed for this. Disconnecting removes the VPN interface, which drops the routes that used it.\n• VPN interface: detected automatically. A VPN is a utun interface with an IP address (shown as \"VPN 10.x.x.x\"); utun entries marked \"(system)\" are not VPNs. It is re-detected every time you return to the app window. If several VPNs are active, pick one manually in the dropdown. To check yourself: run `ifconfig | grep -A3 utun` in Terminal and look for a utun with an `inet` line.\n• IP / domain list: enter an IPv4 address (8.8.8.8) or a domain (github.com). Pasting a full URL works too; the app extracts the domain. The list is saved automatically and is still there next time.\n• Add routes: adds routes via the selected interface for the whole list, asking for the password only once.\n• Delete routes: removes those routes; use it when disconnecting the VPN or to restore the original state.\n• Current routes: shows the routing-table entries matching your list. Click ⟳ to refresh.\n• Log: the result of each command, including errors and the IPs a domain resolved to.")
                     section("About domains",
                             "Routes are attached to IPs, not hostnames. The app resolves a domain to IPs at the moment you click Add/Delete. If a domain uses a CDN or changes IP often, click Add routes again when needed. Routes for an old IP do not disappear on their own if the IP has changed.")
                     section("Notes",
@@ -239,79 +331,162 @@ struct HelpView: View {
     }
 }
 
+struct LogBox: View {
+    @ObservedObject var m: Model
+    var body: some View {
+        GroupBox {
+            VStack(alignment: .leading) {
+                HStack { Text("Log").font(.headline); Spacer(); Button("Clear") { m.log = "" } }
+                ScrollView { Text(m.log.isEmpty ? "(empty)" : m.log).font(.system(.caption, design: .monospaced)).frame(maxWidth: .infinity, alignment: .leading).textSelection(.enabled) }
+                    .frame(height: 110)
+            }.padding(4)
+        }
+    }
+}
+
+/// Screen 1: turn the VPN on/off.
+struct VPNScreen: View {
+    @ObservedObject var m: Model
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 14) {
+                GroupBox {
+                    VStack(spacing: 12) {
+                        HStack(spacing: 10) {
+                            Circle().fill(m.vpnConnected ? Color.green : Color.gray).frame(width: 16, height: 16)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(m.vpnName.isEmpty ? "No VPN selected" : m.vpnName).font(.title2).bold()
+                                Text(m.vpnState).foregroundColor(.secondary)
+                            }
+                            Spacer()
+                            if m.busy { ProgressView().controlSize(.small) }
+                        }
+                        Button(action: { m.toggleVPN() }) {
+                            Text(m.vpnConnected ? "Turn VPN OFF" : "Turn VPN ON").frame(maxWidth: .infinity).padding(.vertical, 4)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.large)
+                        .tint(m.vpnConnected ? .red : .accentColor)
+                        .disabled(m.vpnName.isEmpty || m.busy)
+                        Toggle("Add routes automatically after connecting", isOn: $m.autoRoute).frame(maxWidth: .infinity, alignment: .leading)
+                    }.padding(6)
+                }
+                HStack(spacing: 6) {
+                    Image(systemName: m.vpnDetected ? "checkmark.circle.fill" : "info.circle").foregroundColor(m.vpnDetected ? .green : .secondary)
+                    Text(m.vpnDetected ? "VPN interface: \(m.iface) (\(m.ifaceIPs[m.iface] ?? ""))" : "No VPN interface detected yet.")
+                    Text("·  \(m.ips.count) entries in route list").foregroundColor(.secondary)
+                    Spacer()
+                    Button("Settings…") { m.screen = 1 }
+                }.font(.callout)
+                LogBox(m: m)
+            }.padding(16)
+        }
+    }
+}
+
+/// Screen 2: settings (VPN choice, interface, IP/domain list, manual routes).
+struct SettingsScreen: View {
+    @ObservedObject var m: Model
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 12) {
+                GroupBox("VPN connection") {
+                    HStack {
+                        if m.vpnServices.isEmpty {
+                            Text("No VPN found in macOS network settings").foregroundColor(.secondary)
+                        } else {
+                            Picker("", selection: $m.vpnName) {
+                                ForEach(m.vpnServices, id: \.name) { Text($0.name).tag($0.name) }
+                            }.labelsHidden().frame(width: 220)
+                        }
+                        Button { m.refreshVPN() } label: { Image(systemName: "arrow.clockwise") }.help("Reload VPN list")
+                        Spacer()
+                    }.padding(4)
+                }
+
+                GroupBox("VPN interface") {
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack {
+                            if m.interfaces.isEmpty {
+                                TextField("utun4", text: $m.iface).frame(width: 100)
+                            } else {
+                                Picker("", selection: $m.iface) {
+                                    ForEach(m.interfaces, id: \.self) { n in Text(m.ifaceIPs[n].map { "\(n)  ·  VPN \($0)" } ?? "\(n)  (system)").tag(n) }
+                                }.labelsHidden().frame(width: 220)
+                            }
+                            Button { m.refreshInterfaces() } label: { Image(systemName: "arrow.clockwise") }.help("Re-detect VPN interface")
+                            Spacer()
+                        }
+                        HStack(spacing: 6) {
+                            Image(systemName: m.vpnDetected ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                                .foregroundColor(m.vpnDetected ? .green : .orange)
+                            Text(m.vpnDetected ? "VPN found: \(m.iface) (\(m.ifaceIPs[m.iface] ?? ""))"
+                                               : "No active VPN found. Turn on the VPN, then click the refresh button.")
+                                .font(.callout)
+                        }
+                    }.padding(4)
+                }
+
+                GroupBox("IP / domain list") {
+                    VStack(alignment: .leading) {
+                        HStack {
+                            TextField("Enter an IP or domain, e.g. github.com", text: $m.newIP).onSubmit { m.addIP() }
+                            Button { m.addIP() } label: { Image(systemName: "plus") }
+                        }
+                        List {
+                            ForEach(m.ips, id: \.self) { ip in
+                                HStack {
+                                    Text(ip).font(.system(.body, design: .monospaced))
+                                    Spacer()
+                                    Button { m.remove(ip) } label: { Image(systemName: "trash") }.buttonStyle(.borderless)
+                                }
+                            }
+                        }.frame(height: 110)
+                    }.padding(4)
+                }
+
+                GroupBox("Routes") {
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            Button("Add routes") { m.apply(add: true) }
+                            Button("Delete routes") { m.apply(add: false) }
+                            if m.busy { ProgressView().controlSize(.small) }
+                            Spacer()
+                            Button { m.refreshRoutes() } label: { Image(systemName: "arrow.clockwise") }.help("Refresh current routes")
+                        }.disabled(m.busy)
+                        Text("Current routes").font(.headline)
+                        ScrollView { Text(m.routes).font(.system(.caption, design: .monospaced)).frame(maxWidth: .infinity, alignment: .leading).textSelection(.enabled) }
+                            .frame(height: 80)
+                    }.padding(4)
+                }
+
+                LogBox(m: m)
+            }.padding(16)
+        }
+    }
+}
+
 struct ContentView: View {
     @StateObject private var m = Model()
     @AppStorage("helpShown") private var helpShown = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(spacing: 0) {
             HStack {
-                Text("VPN interface").font(.headline)
-                if m.interfaces.isEmpty {
-                    TextField("utun4", text: $m.iface).frame(width: 100)
-                } else {
-                    Picker("", selection: $m.iface) {
-                        ForEach(m.interfaces, id: \.self) { n in Text(m.ifaceIPs[n].map { "\(n)  ·  VPN \($0)" } ?? "\(n)  (system)").tag(n) }
-                    }.labelsHidden().frame(width: 220)
-                }
-                Button { m.refreshInterfaces() } label: { Image(systemName: "arrow.clockwise") }.help("Re-detect VPN interface")
+                Picker("", selection: $m.screen) {
+                    Text("VPN").tag(0)
+                    Text("Settings").tag(1)
+                }.pickerStyle(.segmented).labelsHidden().frame(width: 220)
                 Spacer()
-                Button("Add routes") { m.apply(add: true) }.keyboardShortcut(.defaultAction)
-                Button("Delete routes") { m.apply(add: false) }
-                if m.busy { ProgressView().controlSize(.small) }
-                Button { m.showHelp = true } label: { Image(systemName: "questionmark.circle") }
-                    .help("User guide")
-            }.disabled(m.busy)
-
-            HStack(spacing: 6) {
-                Image(systemName: m.vpnDetected ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
-                    .foregroundColor(m.vpnDetected ? .green : .orange)
-                Text(m.vpnDetected
-                     ? "VPN found: \(m.iface) (\(m.ifaceIPs[m.iface] ?? ""))"
-                     : "No active VPN found. Turn on the VPN, then click ⟳ to re-detect; adding routes now may send traffic the wrong way.")
-                    .font(.callout)
-                Spacer()
-            }
-            GroupBox("IP / domain list") {
-                VStack(alignment: .leading) {
-                    HStack {
-                        TextField("Enter an IP or domain, e.g. github.com", text: $m.newIP).onSubmit { m.addIP() }
-                        Button { m.addIP() } label: { Image(systemName: "plus") }
-                    }
-                    List {
-                        ForEach(m.ips, id: \.self) { ip in
-                            HStack {
-                                Text(ip).font(.system(.body, design: .monospaced))
-                                Spacer()
-                                Button { m.remove(ip) } label: { Image(systemName: "trash") }.buttonStyle(.borderless)
-                            }
-                        }
-                    }.frame(minHeight: 110)
-                }.padding(4)
-            }
-
-            GroupBox {
-                VStack(alignment: .leading) {
-                    HStack { Text("Current routes").font(.headline); Spacer()
-                        Button { m.refreshRoutes() } label: { Image(systemName: "arrow.clockwise") } }
-                    ScrollView { Text(m.routes).font(.system(.caption, design: .monospaced)).frame(maxWidth: .infinity, alignment: .leading).textSelection(.enabled) }
-                        .frame(height: 80)
-                }.padding(4)
-            }
-
-            GroupBox {
-                VStack(alignment: .leading) {
-                    HStack { Text("Log").font(.headline); Spacer(); Button("Clear") { m.log = "" } }
-                    ScrollView { Text(m.log).font(.system(.caption, design: .monospaced)).frame(maxWidth: .infinity, alignment: .leading).textSelection(.enabled) }
-                        .frame(height: 100)
-                }.padding(4)
-            }
+                Button { m.showHelp = true } label: { Image(systemName: "questionmark.circle") }.help("User guide")
+            }.padding(.horizontal, 16).padding(.vertical, 10)
+            Divider()
+            if m.screen == 0 { VPNScreen(m: m) } else { SettingsScreen(m: m) }
         }
-        .padding(16)
-        .frame(minWidth: 520, minHeight: 560)
+        .frame(minWidth: 480, idealWidth: 560, minHeight: 360, idealHeight: 560)
         .sheet(isPresented: $m.showHelp) { HelpView() }
         .onAppear { if !helpShown { helpShown = true; m.showHelp = true } }
-        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in m.refreshInterfaces(); m.refreshRoutes() }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in m.refreshVPN(); m.refreshInterfaces(); m.refreshRoutes() }
         .onReceive(NotificationCenter.default.publisher(for: .showHelp)) { _ in m.showHelp = true }
     }
 }
@@ -319,7 +494,7 @@ struct ContentView: View {
 @main
 struct VPNRouteApp: App {
     var body: some Scene {
-        WindowGroup("Draytek Custom Route") { ContentView() }
+        WindowGroup("Draytek VPN Custom Route") { ContentView() }
             .commands {
                 CommandGroup(replacing: .help) {
                     Button("User Guide") {
